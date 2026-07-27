@@ -153,7 +153,7 @@ export const reportService = {
           .eq('org_id', orgId)
           .order('acronym')
         const { data: staff } = await supabase
-          .from('persons')
+          .from('persons_secure')
           .select('*')
           .eq('org_id', orgId)
         const { data: assignments } = await supabase
@@ -199,7 +199,7 @@ export const reportService = {
           .eq('org_id', orgId)
           .eq('year', year)
         const { data: staff } = await supabase
-          .from('persons')
+          .from('persons_secure')
           .select('*')
           .eq('org_id', orgId)
         const { data: projects } = await supabase

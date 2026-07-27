@@ -59,6 +59,21 @@ export async function writeAudit({ orgId, entityType, action, entityId, details 
  */
 export async function writeSecurityAudit(entry: SecurityAuditEntry) {
   try {
+    // Failed logins happen BEFORE the user is authenticated, so the RLS check
+    // `org_id = auth_org_id()` could never pass and the insert always failed
+    // silently — the security log contained no failed logins at all.
+    //
+    // Route them through a SECURITY DEFINER function that anon may call and
+    // that resolves the organisation server-side from the attempted email.
+    if (entry.action === 'login_failed') {
+      const { error } = await (supabase.rpc as any)('log_failed_login', {
+        p_email: entry.targetEmail ?? '',
+        p_details: entry.details ?? 'Failed login attempt',
+      })
+      if (error) console.warn('[GrantLume] Failed-login audit write failed:', error.message)
+      return
+    }
+
     const { data: { user } } = await supabase.auth.getUser()
 
     await (supabase.from as any)('audit_log').insert({

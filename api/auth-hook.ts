@@ -1,6 +1,25 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { timingSafeEqual } from 'crypto'
 import { Resend } from 'resend'
-import { signupConfirmationEmail } from './emails/templates.js'
+import { signupConfirmationEmail, renderEmail } from './emails/templates.js'
+import { esc, escUrl } from './lib/html.js'
+
+/**
+ * Constant-time check of the shared secret.
+ *
+ * Supabase can be configured to call this hook with either an
+ * `Authorization: Bearer <secret>` header or the Standard Webhooks
+ * `webhook-signature` scheme. We accept the bearer form (what this deployment
+ * is configured for) and compare without leaking timing information.
+ */
+function verifyHookSecret(req: VercelRequest, expected: string): boolean {
+  const header = req.headers['authorization']
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false
+  const provided = Buffer.from(header.slice('Bearer '.length).trim())
+  const want = Buffer.from(expected)
+  if (provided.length !== want.length) return false
+  return timingSafeEqual(provided, want)
+}
 
 /**
  * Supabase Auth Hook — Send Email
@@ -23,20 +42,23 @@ const FROM_ADDRESS = 'GrantLume <notifications@grantlume.com>'
 const APP_URL = 'https://app.grantlume.com'
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-  if (req.method === 'OPTIONS') return res.status(200).end()
+  // This endpoint is called server-to-server by Supabase Auth. There is no
+  // browser origin to allow, so no CORS headers are emitted at all.
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  // Verify the hook secret if configured
+  // ── AUTHENTICATION ────────────────────────────────────────────────────────
+  // The secret is MANDATORY. It used to be checked only `if (hookSecret)`, so
+  // whenever AUTH_HOOK_SECRET was unset — and it was not even listed in
+  // .env.example — anyone on the internet could POST here and make GrantLume
+  // send password-reset and magic-link emails, from our verified domain, to
+  // any address, with attacker-chosen links. That is a phishing service.
   const hookSecret = process.env.AUTH_HOOK_SECRET
-  if (hookSecret) {
-    const authHeader = req.headers['authorization']
-    if (!authHeader || authHeader !== `Bearer ${hookSecret}`) {
-      return res.status(401).json({ error: 'Unauthorized' })
-    }
+  if (!hookSecret) {
+    console.error('[AuthHook] AUTH_HOOK_SECRET is not set — refusing all requests')
+    return res.status(500).json({ error: 'Auth hook secret not configured' })
+  }
+  if (!verifyHookSecret(req, hookSecret)) {
+    return res.status(401).json({ error: 'Unauthorized' })
   }
 
   const apiKey = process.env.RESEND_API_KEY
@@ -57,7 +79,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const firstName = user.user_metadata?.first_name || email.split('@')[0]
     const actionType = email_data.email_action_type
     const tokenHash = email_data.token_hash
-    const redirectTo = email_data.redirect_to || `${APP_URL}/auth/callback`
 
     console.log(`[AuthHook] Processing ${actionType} email for ${email}`)
 
@@ -69,7 +90,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     switch (actionType) {
       case 'signup': {
-        const template = signupConfirmationEmail({ firstName, confirmUrl })
+        const template = renderEmail(signupConfirmationEmail, { firstName, confirmUrl })
         subject = template.subject
         html = template.html
         break
@@ -132,7 +153,6 @@ const NAVY      = '#1a2744'
 const GOLD      = '#f59e0b'
 const MUTED     = '#6b7280'
 const TEXT      = '#1f2937'
-const TEXT_SEC  = '#4b5563'
 const BG        = '#f8fafc'
 const CARD_BG   = '#ffffff'
 const BORDER    = '#e2e8f0'
@@ -189,7 +209,10 @@ function button(label: string, url: string): string {
 </td></tr></table>`
 }
 
-function buildRecoveryEmail(firstName: string, resetUrl: string): string {
+function buildRecoveryEmail(firstNameRaw: string, resetUrlRaw: string): string {
+  // user_metadata.first_name is client-writable — escape before it reaches HTML.
+  const firstName = esc(firstNameRaw)
+  const resetUrl = escUrl(resetUrlRaw)
   return brandedLayout('Reset Password', [
     heading('Reset your password'),
     paragraph(`Hi ${firstName}, we received a request to reset your password. Click the button below to set a new one.`),
@@ -198,7 +221,9 @@ function buildRecoveryEmail(firstName: string, resetUrl: string): string {
   ].join(''))
 }
 
-function buildEmailChangeEmail(firstName: string, verifyUrl: string): string {
+function buildEmailChangeEmail(firstNameRaw: string, verifyUrlRaw: string): string {
+  const firstName = esc(firstNameRaw)
+  const verifyUrl = escUrl(verifyUrlRaw)
   return brandedLayout('Confirm Email', [
     heading('Confirm your new email'),
     paragraph(`Hi ${firstName}, please click below to confirm your new email address.`),
@@ -207,7 +232,9 @@ function buildEmailChangeEmail(firstName: string, verifyUrl: string): string {
   ].join(''))
 }
 
-function buildMagicLinkEmail(firstName: string, magicUrl: string): string {
+function buildMagicLinkEmail(firstNameRaw: string, magicUrlRaw: string): string {
+  const firstName = esc(firstNameRaw)
+  const magicUrl = escUrl(magicUrlRaw)
   return brandedLayout('Login Link', [
     heading('Your login link'),
     paragraph(`Hi ${firstName}, click the button below to sign in to GrantLume.`),

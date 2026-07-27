@@ -9,7 +9,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toast } from '@/components/ui/use-toast'
 import { emailService } from '@/services/emailService'
+import { memberDirectory } from '@/services/memberDirectoryService'
 import { supabase } from '@/lib/supabase'
+import { logger } from '@/lib/logger'
 import { Lock, Unlock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -32,31 +34,39 @@ export function PeriodLocking() {
         description: t('allocations.periodToggleDesc', { month: MONTH_LABELS[month - 1], year: globalYear, action: result.locked ? t('allocations.locked') : t('allocations.unlocked') }),
       })
 
-      // Send period locked notification (fire-and-forget)
+      // Send period locked notification (fire-and-forget).
+      //
+      // This used to call supabase.auth.admin.getUserById() straight from the
+      // browser. Admin APIs require the service-role key, which the browser
+      // does not have, so every call 403'd and NO period-locked email was ever
+      // sent. Resolve the addresses through the server instead.
       if (result.locked) {
         const period = `${MONTH_LABELS[month - 1]} ${globalYear}`
-        Promise.resolve(
-          supabase
-            .from('org_members')
-            .select('user_id')
-            .eq('org_id', orgId)
-            .neq('user_id', user.id)
-        ).then(({ data: members }) => {
-            if (!members) return
-            members.forEach(async (m: any) => {
-              const { data: userData } = await supabase.auth.admin.getUserById(m.user_id).catch(() => ({ data: null }))
-              const email = (userData as any)?.user?.email
-              if (email) {
-                emailService.sendPeriodLocked({
-                  to: email,
-                  recipientName: email.split('@')[0],
-                  orgName: orgName ?? 'the organisation',
-                  period,
-                  lockedBy: user.email ?? 'An administrator',
-                }).catch(() => {})
-              }
-            })
-          }).catch(() => {})
+        void (async () => {
+          try {
+            const { data: members } = await supabase
+              .from('org_members')
+              .select('user_id')
+              .eq('org_id', orgId)
+              .neq('user_id', user.id)
+
+            const userIds = (members ?? []).map((m: { user_id: string }) => m.user_id)
+            if (userIds.length === 0) return
+
+            const emails = await memberDirectory.resolveEmails(orgId, userIds)
+            for (const email of Object.values(emails)) {
+              await emailService.sendPeriodLocked({
+                to: email,
+                recipientName: email.split('@')[0],
+                orgName: orgName ?? 'the organisation',
+                period,
+                lockedBy: user.email ?? 'An administrator',
+              })
+            }
+          } catch (err) {
+            logger.warn('Failed to send period-locked notifications', { source: 'PeriodLocking' }, err)
+          }
+        })()
       }
 
       refetch()

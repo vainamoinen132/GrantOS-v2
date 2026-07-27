@@ -1,5 +1,10 @@
 import { supabase } from '@/lib/supabase'
 
+const BUCKET = 'project-documents'
+
+/** How long a generated download link stays valid. */
+const SIGNED_URL_TTL_SECONDS = 300 // 5 minutes
+
 export interface ProjectDocument {
   id: string
   org_id: string
@@ -47,17 +52,18 @@ export const documentService = {
 
     // Upload to Supabase Storage
     const { error: uploadError } = await supabase.storage
-      .from('project-documents')
+      .from(BUCKET)
       .upload(filePath, file)
 
     if (uploadError) throw uploadError
 
-    // Get public URL
-    const { data: urlData } = supabase.storage
-      .from('project-documents')
-      .getPublicUrl(filePath)
-
-    // Insert record
+    // Store the STORAGE PATH, not a URL.
+    //
+    // This used to call getPublicUrl(), which only produces a working link on
+    // a PUBLIC bucket — meaning every grant agreement, contract and financial
+    // annex was readable by anyone who had the link, with no login and no
+    // expiry. The bucket is now private and links are minted on demand by
+    // getDownloadUrl() below, valid for a few minutes.
     const { data, error } = await supabase
       .from('project_documents')
       .insert({
@@ -66,7 +72,7 @@ export const documentService = {
         title,
         name: file.name,
         file_name: file.name,
-        file_url: urlData.publicUrl,
+        file_url: filePath,
         file_size_bytes: file.size,
         uploaded_by: userId,
         uploaded_at: new Date().toISOString(),
@@ -79,13 +85,26 @@ export const documentService = {
     return data as ProjectDocument
   },
 
+  /**
+   * Mint a short-lived, authenticated download link for a document.
+   * Call this at click time — never store the result.
+   */
+  async getDownloadUrl(fileUrl: string | null): Promise<string | null> {
+    const path = toStoragePath(fileUrl)
+    if (!path) return null
+
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUrl(path, SIGNED_URL_TTL_SECONDS)
+
+    if (error) throw error
+    return data?.signedUrl ?? null
+  },
+
   async remove(id: string, fileUrl: string | null): Promise<void> {
-    // Delete from storage if URL exists
-    if (fileUrl) {
-      const path = fileUrl.split('/project-documents/')[1]
-      if (path) {
-        await supabase.storage.from('project-documents').remove([path])
-      }
+    const path = toStoragePath(fileUrl)
+    if (path) {
+      await supabase.storage.from(BUCKET).remove([path])
     }
 
     const { error } = await supabase
@@ -95,4 +114,22 @@ export const documentService = {
 
     if (error) throw error
   },
+}
+
+/**
+ * Normalise a stored `file_url` to a storage path.
+ *
+ * Rows created before this change hold a full public URL; new rows hold the
+ * bare path. Handle both so existing documents keep working.
+ */
+function toStoragePath(fileUrl: string | null): string | null {
+  if (!fileUrl) return null
+  const marker = `/${BUCKET}/`
+  const idx = fileUrl.indexOf(marker)
+  if (idx >= 0) {
+    // Legacy public URL: .../storage/v1/object/public/project-documents/<path>
+    return decodeURIComponent(fileUrl.slice(idx + marker.length).split('?')[0])
+  }
+  // Already a storage path.
+  return fileUrl.replace(/^\/+/, '')
 }

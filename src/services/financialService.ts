@@ -14,6 +14,35 @@ export interface BudgetRow {
   year: number
 }
 
+/**
+ * Aggregate personnel cost per project for a year.
+ *
+ * This used to embed `persons(annual_salary)` in an assignments query, pulling
+ * every individual salary into the browser for anyone who could reach the
+ * financials screen. SELECT on that column is now revoked; the database
+ * computes the aggregate instead and refuses callers without the
+ * financial-details permission.
+ */
+async function fetchPersonnelTotals(
+  orgId: string,
+  year: number,
+  type: 'actual' | 'official' = 'actual',
+): Promise<Map<string, number>> {
+  const { data, error } = await (supabase as any).rpc('get_personnel_costs', {
+    p_org_id: orgId,
+    p_year: year,
+    p_type: type,
+  })
+
+  if (error) throw error
+
+  const totals = new Map<string, number>()
+  for (const row of (data ?? []) as { project_id: string; total_cost: number | null }[]) {
+    totals.set(row.project_id, Number(row.total_cost ?? 0))
+  }
+  return totals
+}
+
 export const financialService = {
   async listBudgets(orgId: string | null, year: number): Promise<FinancialBudget[]> {
     let query = supabase
@@ -150,23 +179,8 @@ export const financialService = {
    * and write them into the financial_budgets 'personnel' rows.
    */
   async syncPersonnelActuals(orgId: string, year: number): Promise<number> {
-    // 1. Compute actuals from assignments
-    const { data, error } = await supabase
-      .from('assignments')
-      .select('project_id, pms, persons(annual_salary)')
-      .eq('org_id', orgId)
-      .eq('year', year)
-      .eq('type', 'actual')
-
-    if (error) throw error
-
-    const totals = new Map<string, number>()
-    for (const row of data ?? []) {
-      const salary = (row as any).persons?.annual_salary ?? 0
-      const monthlySalary = salary / 12
-      const cost = row.pms * monthlySalary
-      totals.set(row.project_id, (totals.get(row.project_id) ?? 0) + cost)
-    }
+    // 1. Compute actuals server-side (salaries never reach the browser)
+    const totals = await fetchPersonnelTotals(orgId, year, 'actual')
 
     // 2. Fetch existing personnel budget rows
     const { data: budgetRows, error: bErr } = await supabase
@@ -198,23 +212,7 @@ export const financialService = {
     orgId: string,
     year: number,
   ): Promise<{ project_id: string; total: number }[]> {
-    const { data, error } = await supabase
-      .from('assignments')
-      .select('project_id, pms, persons(annual_salary)')
-      .eq('org_id', orgId)
-      .eq('year', year)
-      .eq('type', 'actual')
-
-    if (error) throw error
-
-    const totals = new Map<string, number>()
-    for (const row of data ?? []) {
-      const salary = (row as any).persons?.annual_salary ?? 0
-      const monthlySalary = salary / 12
-      const cost = row.pms * monthlySalary
-      totals.set(row.project_id, (totals.get(row.project_id) ?? 0) + cost)
-    }
-
+    const totals = await fetchPersonnelTotals(orgId, year, 'actual')
     return Array.from(totals.entries()).map(([project_id, total]) => ({ project_id, total }))
   },
 

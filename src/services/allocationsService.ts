@@ -120,25 +120,52 @@ export const allocationsService = {
     cells: (AllocationCell & { org_id: string })[],
   ): Promise<Assignment[]> {
     if (cells.length === 0) return []
-    // Atomic upsert at the statement level — if any row fails the whole
-    // statement rolls back. Much safer than looping one-by-one, which
-    // partially persisted state on the first error.
-    const rows = cells.map(c => ({
-      org_id: c.org_id,
-      person_id: c.person_id,
-      project_id: c.project_id,
-      work_package_id: c.work_package_id ?? null,
-      year: c.year,
-      month: c.month,
-      pms: c.pms,
-      type: c.type,
-    }))
-    const { data, error } = await supabase
-      .from('assignments')
-      .upsert(rows, { onConflict: 'person_id,project_id,work_package_id,year,month,type' })
-      .select()
-    if (error) throw error
-    return (data ?? []) as Assignment[]
+
+    // WHY THIS IS SPLIT IN TWO
+    // ------------------------
+    // PostgreSQL treats NULLs as distinct in a unique index, so a row with no
+    // work package never "conflicts" with the existing row for the same
+    // person/project/month. `fix_assignment_upsert.sql` worked around that by
+    // replacing the plain constraint with an index on
+    // COALESCE(work_package_id, ...) — but PostgREST's `on_conflict` can only
+    // infer a PLAIN-column index, so the bulk save either errored with 42P10
+    // ("no unique or exclusion constraint matching the ON CONFLICT
+    // specification") or hit a duplicate-key violation on the expression
+    // index. Either way, saving the allocation grid failed.
+    //
+    // Rows WITH a work package now use a partial unique index that
+    // ON CONFLICT can infer. Rows WITHOUT one take an explicit
+    // find-then-update path, which mirrors what timesheetService already does
+    // for timesheet_days.
+    const withWp = cells.filter(c => !!c.work_package_id)
+    const withoutWp = cells.filter(c => !c.work_package_id)
+
+    const results: Assignment[] = []
+
+    if (withWp.length > 0) {
+      const rows = withWp.map(c => ({
+        org_id: c.org_id,
+        person_id: c.person_id,
+        project_id: c.project_id,
+        work_package_id: c.work_package_id,
+        year: c.year,
+        month: c.month,
+        pms: c.pms,
+        type: c.type,
+      }))
+      const { data, error } = await supabase
+        .from('assignments')
+        .upsert(rows, { onConflict: 'person_id,project_id,work_package_id,year,month,type' })
+        .select()
+      if (error) throw error
+      results.push(...((data ?? []) as Assignment[]))
+    }
+
+    for (const cell of withoutWp) {
+      results.push(await allocationsService.upsertAssignment(cell))
+    }
+
+    return results
   },
 
   async deleteAssignment(id: string): Promise<void> {

@@ -2,6 +2,31 @@ import { supabase } from '@/lib/supabase'
 import { writeAudit } from './auditWriter'
 import type { FundingScheme, Organisation } from '@/types'
 
+/**
+ * Every organisation column EXCEPT `docusign_rsa_private_key`.
+ *
+ * That column is a signing key. `select('*')` pulled it into every user's
+ * browser — a Viewer could read their company's DocuSign private key straight
+ * out of a network response. SELECT on it is now revoked at the database level
+ * (see supabase/2026_07_critical_security_fixes.sql), so `*` would fail
+ * outright; we list the safe columns explicitly instead.
+ *
+ * `docusign_key_configured` is a boolean maintained by trigger, so the
+ * Integrations screen can still show whether a key is saved.
+ */
+const ORG_SAFE_COLUMNS = [
+  'id', 'name', 'country', 'currency',
+  'working_hours_per_day', 'working_days_per_year',
+  'default_overhead_rate', 'average_personnel_rate_pm',
+  'departments', 'default_vacation_days', 'ai_enabled',
+  'timesheets_drive_allocations', 'private_absence_types',
+  'plan', 'trial_ends_at', 'is_active',
+  'stripe_customer_id', 'stripe_subscription_id', 'subscription_status',
+  'docusign_integration_key', 'docusign_user_id', 'docusign_account_id',
+  'docusign_base_url', 'docusign_oauth_base_url', 'docusign_key_configured',
+  'created_at', 'updated_at',
+].join(', ')
+
 export const settingsService = {
   // Funding Schemes
   async listFundingSchemes(orgId: string | null): Promise<FundingScheme[]> {
@@ -60,12 +85,12 @@ export const settingsService = {
   async getOrganisation(orgId: string): Promise<Organisation | null> {
     const { data, error } = await supabase
       .from('organisations')
-      .select('*')
+      .select(ORG_SAFE_COLUMNS)
       .eq('id', orgId)
       .single()
 
     if (error) throw error
-    return data as Organisation
+    return data as unknown as Organisation
   },
 
   async updateOrganisation(orgId: string, updates: Partial<Organisation>): Promise<Organisation> {
@@ -73,11 +98,11 @@ export const settingsService = {
       .from('organisations')
       .update({ ...updates, updated_at: new Date().toISOString() } as any)
       .eq('id', orgId)
-      .select()
+      .select(ORG_SAFE_COLUMNS)
       .single()
 
     if (error) throw error
     writeAudit({ orgId: orgId, entityType: 'organisation', action: 'update', entityId: orgId, details: 'Updated organisation settings' })
-    return data as Organisation
+    return data as unknown as Organisation
   },
 }

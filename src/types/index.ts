@@ -687,7 +687,32 @@ export interface ProposalAuditEvent {
   created_at: string
 }
 
-export type NotificationType = 'info' | 'success' | 'warning' | 'assignment' | 'approval' | 'alert' | 'invitation' | 'system'
+/**
+ * Must stay in sync with the `notifications_type_check` constraint in
+ * supabase/2026_07_critical_security_fixes.sql.
+ *
+ * The original constraint only allowed the eight generic values below, but the
+ * cron jobs and the Stripe webhook inserted types like 'trial_expiring' and
+ * 'collab_report_reminder'. Every one of those inserts violated the CHECK and
+ * was swallowed by a try/catch — so those notifications silently never
+ * appeared. Both sides now list the same values.
+ */
+export type NotificationType =
+  // generic
+  | 'info' | 'success' | 'warning' | 'alert' | 'system'
+  // workflow
+  | 'assignment' | 'approval' | 'invitation'
+  // billing / lifecycle
+  | 'trial_expiring' | 'trial_expired'
+  | 'subscription_upgraded' | 'subscription_cancelled' | 'payment_failed'
+  // collaboration reminders
+  | 'collab_report_reminder' | 'collab_deliverable_reminder'
+  | 'collab_milestone_reminder' | 'collab_report_status'
+  // timesheets
+  | 'timesheet_submitted' | 'timesheet_approved' | 'timesheet_rejected'
+  | 'timesheet_ready_to_sign' | 'timesheet_signed'
+  // periods / projects
+  | 'period_locked' | 'project_alert' | 'budget_alert'
 
 export interface AppNotification {
   id: string

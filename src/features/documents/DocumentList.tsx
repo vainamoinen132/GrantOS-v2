@@ -31,6 +31,28 @@ export function DocumentList({ projectId }: DocumentListProps) {
   const [uploading, setUploading] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<ProjectDocument | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [openingId, setOpeningId] = useState<string | null>(null)
+
+  /**
+   * Documents live in a PRIVATE bucket now, so there is no permanent URL to
+   * put in an href. Mint a short-lived signed link at click time instead.
+   */
+  const handleOpen = async (doc: ProjectDocument) => {
+    setOpeningId(doc.id)
+    try {
+      const url = await documentService.getDownloadUrl(doc.file_url)
+      if (!url) {
+        toast({ title: 'Error', description: 'This document is no longer available.', variant: 'destructive' })
+        return
+      }
+      window.open(url, '_blank', 'noopener,noreferrer')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not open the document'
+      toast({ title: 'Error', description: message, variant: 'destructive' })
+    } finally {
+      setOpeningId(null)
+    }
+  }
 
   const handleUpload = async () => {
     if (!orgId || !user || !file) return
@@ -102,10 +124,13 @@ export function DocumentList({ projectId }: DocumentListProps) {
                   </div>
                   <div className="flex gap-1">
                     {doc.file_url && (
-                      <Button variant="ghost" size="icon" asChild>
-                        <a href={doc.file_url} target="_blank" rel="noopener noreferrer">
-                          <ExternalLink className="h-4 w-4" />
-                        </a>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        disabled={openingId === doc.id}
+                        onClick={() => handleOpen(doc)}
+                      >
+                        <ExternalLink className="h-4 w-4" />
                       </Button>
                     )}
                     {can('canWrite') && (

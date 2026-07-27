@@ -1,5 +1,4 @@
 import { supabase } from '@/lib/supabase'
-import { useAuthStore } from '@/stores/authStore'
 import { writeAudit } from './auditWriter'
 import type { Person } from '@/types'
 
@@ -11,22 +10,36 @@ export interface StaffFilters {
 }
 
 /**
- * Salary and overhead_rate are sensitive. We expose them only to callers
- * whose `canSeeSalary` permission is true. Everyone else reads from the
- * `persons_masked` view which omits those columns server-side. A malicious
- * caller who hits `from('persons')` directly is still bounded by RLS, but
- * the masked read is the correct default.
+ * Salary and overhead_rate are sensitive.
+ *
+ * This used to switch between `persons` and `persons_masked` based on a
+ * CLIENT-SIDE permission flag — which protected nothing, because RLS is
+ * row-level and any org member could simply request `from('persons')
+ * .select('*')` and read every salary in the company.
+ *
+ * The database now enforces it:
+ *   - SELECT on persons.annual_salary / overhead_rate is REVOKED, so those
+ *     columns cannot be read from the client at all;
+ *   - `persons_secure` returns them only when can_see_salary() is true for the
+ *     caller, and scopes rows to the caller's organisation in the view itself.
+ *
+ * Every read therefore goes through `persons_secure`. Writes still go to the
+ * base table, where RLS applies as before.
  */
-function canSeeSalary(): boolean {
-  try {
-    return !!useAuthStore.getState().can('canSeeSalary')
-  } catch {
-    return false
-  }
-}
+const PERSONS_VIEW = 'persons_secure'
+
+/**
+ * Columns that are safe to read back after a write. `.select()` with no
+ * argument means `*`, which now fails because of the revoked salary columns.
+ */
+const PERSON_WRITE_RETURN_COLUMNS =
+  'id, org_id, full_name, email, department, role, employment_type, fte, ' +
+  'start_date, end_date, country, region, is_active, avatar_url, ' +
+  'vacation_days_per_year, user_id, invite_status, invite_role, ' +
+  'created_at, updated_at'
 
 function personsSource() {
-  return canSeeSalary() ? 'persons' : 'persons_masked'
+  return PERSONS_VIEW
 }
 
 export const staffService = {
@@ -77,12 +90,13 @@ export const staffService = {
     const { data, error } = await supabase
       .from('persons')
       .insert(person)
-      .select()
+      .select(PERSON_WRITE_RETURN_COLUMNS)
       .single()
 
     if (error) throw error
-    writeAudit({ orgId: person.org_id, entityType: 'person', action: 'create', entityId: (data as Person).id, details: `Created person ${person.full_name}` })
-    return data as Person
+    const created = data as unknown as Person
+    writeAudit({ orgId: person.org_id, entityType: 'person', action: 'create', entityId: created.id, details: `Created person ${person.full_name}` })
+    return created
   },
 
   async update(id: string, updates: Partial<Person>): Promise<Person> {
@@ -90,12 +104,13 @@ export const staffService = {
       .from('persons')
       .update({ ...updates, updated_at: new Date().toISOString() })
       .eq('id', id)
-      .select()
+      .select(PERSON_WRITE_RETURN_COLUMNS)
       .single()
 
     if (error) throw error
-    writeAudit({ orgId: (data as Person).org_id, entityType: 'person', action: 'update', entityId: id, details: `Updated person ${(data as Person).full_name}` })
-    return data as Person
+    const updated = data as unknown as Person
+    writeAudit({ orgId: updated.org_id, entityType: 'person', action: 'update', entityId: id, details: `Updated person ${updated.full_name}` })
+    return updated
   },
 
   async remove(id: string): Promise<void> {

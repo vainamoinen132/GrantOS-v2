@@ -2,6 +2,7 @@ import { supabase } from '@/lib/supabase'
 import { emailService } from './emailService'
 import { notificationService } from './notificationService'
 import { timesheetApproverService } from './timesheetApproverService'
+import { memberDirectory } from './memberDirectoryService'
 import type { TimesheetEntry, TimesheetStatus, TimesheetDay } from '@/types'
 import { hoursToPm } from '@/lib/pmUtils'
 
@@ -159,45 +160,49 @@ export const timesheetService = {
 
     if (error) throw error
 
-    // Fire-and-forget: notify admins/approvers
+    // Fire-and-forget: notify admins/approvers.
+    //
+    // This used to call supabase.auth.admin.getUserById() from the browser.
+    // That is a service-role-only API, so every call 403'd and the
+    // "timesheet submitted" email was never actually sent to anyone. Resolve
+    // the addresses through the server endpoint instead.
     const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
     const period = `${MONTHS[month - 1]} ${year}`
-    Promise.resolve(
-      supabase
-        .from('persons')
-        .select('full_name')
-        .eq('id', personId)
-        .single()
-    ).then(({ data: person }) => {
-      const submitterName = (person as any)?.full_name ?? 'A team member'
-      // Get org admins / approvers
-      Promise.resolve(
-        supabase
+    void (async () => {
+      try {
+        const { data: person } = await supabase
+          .from('persons')
+          .select('full_name')
+          .eq('id', personId)
+          .single()
+        const submitterName = (person as any)?.full_name ?? 'A team member'
+
+        const { data: admins } = await supabase
           .from('org_members')
           .select('user_id')
           .eq('org_id', orgId)
           .in('role', ['Admin', 'Finance Officer'])
-      ).then(({ data: admins }) => {
-        if (!admins) return
-        for (const a of admins) {
-          if (a.user_id === userId) continue
-          supabase.auth.admin.getUserById(a.user_id)
-            .then(({ data: userData }) => {
-              const email = (userData as any)?.user?.email
-              if (email) {
-                emailService.sendTimesheetSubmitted({
-                  to: email,
-                  approverName: email.split('@')[0],
-                  submitterName,
-                  orgName: '',
-                  period,
-                  timesheetUrl: `${typeof window !== 'undefined' ? window.location.origin : ''}/timesheets`,
-                }).catch(() => {})
-              }
-            }).catch(() => {})
+
+        const recipientIds = (admins ?? [])
+          .map((a: { user_id: string }) => a.user_id)
+          .filter((id: string) => id !== userId)
+        if (recipientIds.length === 0) return
+
+        const emails = await memberDirectory.resolveEmails(orgId, recipientIds)
+        for (const email of Object.values(emails)) {
+          await emailService.sendTimesheetSubmitted({
+            to: email,
+            approverName: email.split('@')[0],
+            submitterName,
+            orgName: '',
+            period,
+            timesheetUrl: `${typeof window !== 'undefined' ? window.location.origin : ''}/timesheets`,
+          })
         }
-      }).catch(() => {})
-    }).catch(() => {})
+      } catch (err) {
+        console.warn('[GrantLume] Failed to send timesheet-submitted emails:', err)
+      }
+    })()
 
     // Fire-and-forget: in-app notifications for admins AND timesheet approvers
     const MONTHS2 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']

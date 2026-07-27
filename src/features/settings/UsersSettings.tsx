@@ -86,7 +86,7 @@ export function UsersSettings() {
         try {
           const { data: persons } = await supabase
             .from('persons')
-            .select('*')
+            .select('user_id, full_name')
             .eq('org_id', orgId)
           if (persons) {
             const personMap: Record<string, string> = {}
@@ -244,6 +244,22 @@ export function UsersSettings() {
       const memberEmail = deleteTarget.user_email
       const memberName = deleteTarget.person_name || memberEmail?.split('@')[0] || 'User'
 
+      // Send the notice BEFORE removing the membership.
+      //
+      // /api/send-email now only accepts recipients that are reachable from
+      // the caller's organisation. Once the org_members row is gone this
+      // address no longer qualifies, so the "you have been removed" email
+      // would be rejected. Sending first keeps the recipient provably a member
+      // at send time; the trade-off — a spurious notice if the delete below
+      // then fails — is both rare and harmless.
+      if (memberEmail) {
+        await emailService.sendMemberRemoved({
+          to: memberEmail,
+          userName: memberName,
+          orgName: orgName ?? 'the organisation',
+        }).catch(() => { /* best effort — never block the removal */ })
+      }
+
       const { error } = await supabase
         .from('org_members')
         .delete()
@@ -253,15 +269,6 @@ export function UsersSettings() {
       toast({ title: t('settings.memberRemoved') })
       setDeleteTarget(null)
       fetchMembers()
-
-      // Fire-and-forget: notify the removed member via email
-      if (memberEmail) {
-        emailService.sendMemberRemoved({
-          to: memberEmail,
-          userName: memberName,
-          orgName: orgName ?? 'the organisation',
-        }).catch(() => {})
-      }
     } catch (err) {
       const message = err instanceof Error ? err.message : t('common.failedToDelete')
       toast({ title: t('common.error'), description: message, variant: 'destructive' })

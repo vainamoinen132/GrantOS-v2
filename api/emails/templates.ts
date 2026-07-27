@@ -4,11 +4,50 @@
  *
  * Redesigned March 2026 — modern layout with GrantLume logo SVG,
  * improved typography, refined color palette, and all new templates.
+ *
+ * SECURITY — call templates through `renderEmail()`, never directly
+ * -----------------------------------------------------------------
+ * Every value below is interpolated straight into an HTML string, and these
+ * emails go out from a verified GrantLume domain. `renderEmail()` escapes the
+ * params first (see api/lib/html.ts) so a person name, project title or
+ * support message cannot inject markup or a look-alike link into a message
+ * that carries our branding and our SPF/DKIM alignment.
+ *
+ * `renderEmail()` also supplies the per-recipient preferences URL. The old
+ * approach string-replaced `href="https://app.grantlume.com/profile"` in the
+ * finished HTML, which was brittle and — because it ran once for a whole batch
+ * — handed every recipient the FIRST recipient's unsubscribe token.
  */
+
+import { escapeParams } from '../lib/html.js'
+
+/**
+ * Per-render preferences URL. Set only for the duration of one synchronous
+ * template call by renderEmail(), so concurrent requests cannot see each
+ * other's value (template functions never await).
+ */
+let _preferencesUrl: string | undefined
+
+/**
+ * Render a template with escaped params and a recipient-specific preferences
+ * link. This is the only supported way to produce an email.
+ */
+export function renderEmail<P extends Record<string, any>>(
+  template: (params: P) => EmailTemplate,
+  params: P,
+  preferencesUrl?: string,
+): EmailTemplate {
+  const previous = _preferencesUrl
+  _preferencesUrl = preferencesUrl
+  try {
+    return template(escapeParams(params ?? ({} as P)))
+  } finally {
+    _preferencesUrl = previous
+  }
+}
 
 // ── Brand palette ──────────────────────────────────────
 const BRAND     = '#0d9488'   // teal-600 — primary brand
-const BRAND_DK  = '#0f766e'   // teal-700 — darker hover
 const NAVY      = '#1a2744'   // dark navy — headings, icon bg
 const GOLD      = '#f59e0b'   // amber-500 — star accent
 const MUTED     = '#6b7280'   // gray-500
@@ -34,7 +73,11 @@ const WORDMARK = `<span style="font-size:20px;font-weight:700;letter-spacing:-0.
 // ── Shared helpers ─────────────────────────────────────
 
 function layout(title: string, body: string, unsubscribeUrl?: string): string {
-  const prefsLink = unsubscribeUrl || 'https://app.grantlume.com/profile'
+  // Resolution order: explicit argument → the per-recipient URL supplied by
+  // renderEmail() → a generic profile link for anything rendered outside it.
+  const resolved = unsubscribeUrl || _preferencesUrl
+  const prefsLink = resolved || 'https://app.grantlume.com/profile'
+  const hasToken = !!resolved
   return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -60,7 +103,7 @@ function layout(title: string, body: string, unsubscribeUrl?: string): string {
   <p style="margin:0;font-size:11px;color:${MUTED};text-align:center;">
     <a href="${prefsLink}" style="color:${BRAND};text-decoration:underline;">Manage notification preferences</a>
     &nbsp;&middot;&nbsp;
-    <a href="${prefsLink}${unsubscribeUrl ? '&action=unsubscribe-all' : ''}" style="color:${MUTED};text-decoration:underline;">Unsubscribe</a>
+    <a href="${prefsLink}${hasToken ? '&action=unsubscribe-all' : ''}" style="color:${MUTED};text-decoration:underline;">Unsubscribe</a>
     &nbsp;&middot;&nbsp;
     <a href="https://grantlume.com" style="color:${BRAND};text-decoration:underline;">grantlume.com</a>
   </p>

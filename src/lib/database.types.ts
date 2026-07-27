@@ -2021,6 +2021,40 @@ export type Database = {
         }
         Relationships: []
       }
+      /**
+       * The single read path for staff data. Scopes rows to the caller's
+       * organisation in the view itself, and returns annual_salary /
+       * overhead_rate only when can_see_salary() is true for the caller —
+       * both columns have SELECT revoked on the base `persons` table.
+       * See supabase/2026_07_critical_security_fixes.sql (C3).
+       */
+      persons_secure: {
+        Row: {
+          id: string
+          org_id: string
+          full_name: string
+          email: string | null
+          department: string | null
+          role: string | null
+          employment_type: string
+          fte: number
+          start_date: string | null
+          end_date: string | null
+          country: string | null
+          region: string | null
+          is_active: boolean
+          avatar_url: string | null
+          vacation_days_per_year: number | null
+          user_id: string | null
+          invite_status: string | null
+          invite_role: string | null
+          created_at: string
+          updated_at: string
+          annual_salary: number | null
+          overhead_rate: number | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
       auth_org_id: {

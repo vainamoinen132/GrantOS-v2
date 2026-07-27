@@ -183,7 +183,12 @@ describe('ROUTE_PERMISSIONS', () => {
     expect(paths).toContain('/financials')
     expect(paths).toContain('/timeline')
     expect(paths).toContain('/reports')
-    expect(paths).toContain('/import')
+    // NOTE: '/import' is deliberately absent. The Import feature
+    // (src/features/import/) has no route and is not imported anywhere — it is
+    // unreachable dead code, and the `canSeeImport` toggle on the Role
+    // Permissions screen therefore controls nothing. Tracked as BACKLOG.md B13:
+    // either wire the feature up (and restore this assertion) or delete it
+    // along with the permission.
     expect(paths).toContain('/audit')
     expect(paths).toContain('/proposals')
     expect(paths).toContain('/settings')

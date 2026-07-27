@@ -9,9 +9,25 @@ import {
   collabReportReminderEmail,
   collabDeliverableReminderEmail,
   collabMilestoneReminderEmail,
+  renderEmail,
 } from './emails/templates.js'
+import { appUrl } from './lib/appUrl.js'
 
 /** Maps template names to user_preferences column */
+/**
+ * These jobs fan out across every organisation, so they need far more than the
+ * default function timeout. Without this they were silently cut off part-way
+ * through, sending some reminders and not others. See BACKLOG.md B14 for the
+ * remaining batching / idempotency work.
+ */
+export const config = {
+  maxDuration: 300,
+}
+
+function appUrlResolved(): string {
+  return appUrl()
+}
+
 const CRON_PREF_MAP: Record<string, string> = {
   timesheetReminder: 'email_timesheet_reminders',
   projectEndingSoon: 'email_project_alerts',
@@ -54,13 +70,9 @@ async function checkCronRecipient(
   }
 }
 
-/** Inject personalized unsubscribe URL into email HTML */
-function injectUnsub(html: string, token: string, appUrl: string): string {
-  const prefsUrl = `${appUrl}/email-preferences?token=${token}`
-  return html.replace(
-    /href="https:\/\/app\.grantlume\.com\/profile"/g,
-    `href="${prefsUrl}"`
-  )
+/** Build the per-recipient email-preferences URL. */
+function prefsUrl(token: string | null, base: string): string | undefined {
+  return token ? `${base}/email-preferences?token=${encodeURIComponent(token)}` : undefined
 }
 
 /**
@@ -94,7 +106,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const supabase: any = createClient(supabaseUrl, supabaseKey)
   const resend = new Resend(resendKey)
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://app.grantlume.com'
+  const appUrl = appUrlResolved()
   const from = 'GrantLume <notifications@grantlume.com>'
 
   const job = (req.query.job as string) || ''
@@ -178,13 +190,12 @@ async function runTimesheetReminders(
           const { allowed, unsubscribeToken } = await checkCronRecipient(supabase, userId, 'timesheetReminder')
           if (!allowed) continue
 
-          const { subject, html: rawHtml } = timesheetReminderEmail({
+          const { subject, html } = renderEmail(timesheetReminderEmail, {
             userName: person.full_name,
             orgName: org.name,
             period,
             timesheetUrl: `${appUrl}/timesheets`,
-          })
-          const html = unsubscribeToken ? injectUnsub(rawHtml, unsubscribeToken, appUrl) : rawHtml
+          }, prefsUrl(unsubscribeToken, appUrl))
 
           try {
             await resend.emails.send({ from, to: person.email, subject, html })
@@ -194,7 +205,7 @@ async function runTimesheetReminders(
           }
         } else {
           // No user account found — send without preference check
-          const { subject, html } = timesheetReminderEmail({
+          const { subject, html } = renderEmail(timesheetReminderEmail, {
             userName: person.full_name,
             orgName: org.name,
             period,
@@ -270,7 +281,7 @@ async function runProjectAlerts(
           const { allowed, unsubscribeToken } = await checkCronRecipient(supabase, manager.user_id, 'projectEndingSoon')
           if (!allowed) continue
 
-          const { subject, html: rawHtml } = projectEndingSoonEmail({
+          const { subject, html } = renderEmail(projectEndingSoonEmail, {
             recipientName: email.split('@')[0],
             orgName: org?.name ?? 'your organisation',
             projectAcronym: project.acronym,
@@ -278,8 +289,7 @@ async function runProjectAlerts(
             endDate: project.end_date,
             daysRemaining: days,
             projectUrl: `${appUrl}/projects/${project.id}`,
-          })
-          const html = unsubscribeToken ? injectUnsub(rawHtml, unsubscribeToken, appUrl) : rawHtml
+          }, prefsUrl(unsubscribeToken, appUrl))
 
           try {
             await resend.emails.send({ from, to: email, subject, html })
@@ -340,12 +350,11 @@ async function runProjectAlerts(
 
           // Send appropriate email
           if (days === 0) {
-            const { subject, html: rawHtml } = trialExpiredEmail({
+            const { subject, html } = renderEmail(trialExpiredEmail, {
               userName: email.split('@')[0],
               orgName: org.name,
               upgradeUrl: `${appUrl}/settings?tab=subscription`,
-            })
-            const html = unsubscribeToken ? injectUnsub(rawHtml, unsubscribeToken, appUrl) : rawHtml
+            }, prefsUrl(unsubscribeToken, appUrl))
             try {
               await resend.emails.send({ from, to: email, subject, html })
               totalSent++
@@ -353,13 +362,12 @@ async function runProjectAlerts(
               console.error(`[cron] Failed to send trial expired email to ${email}:`, emailErr)
             }
           } else {
-            const { subject, html: rawHtml } = trialExpiringEmail({
+            const { subject, html } = renderEmail(trialExpiringEmail, {
               userName: email.split('@')[0],
               orgName: org.name,
               daysRemaining: days,
               upgradeUrl: `${appUrl}/settings?tab=subscription`,
-            })
-            const html = unsubscribeToken ? injectUnsub(rawHtml, unsubscribeToken, appUrl) : rawHtml
+            }, prefsUrl(unsubscribeToken, appUrl))
             try {
               await resend.emails.send({ from, to: email, subject, html })
               totalSent++
@@ -486,16 +494,15 @@ async function runCollabReminders(
                 }
                 if (!skipEmail) {
                   try {
-                    const template = collabReportReminderEmail({
+                    const template = renderEmail(collabReportReminderEmail, {
                       contactName: partner.contact_name || '',
                       orgName: partner.org_name,
                       projectAcronym: proj.acronym,
                       periodTitle: period.title,
                       dueDate: period.due_date,
                       reportUrl: `${appUrl}/projects/collaboration/report/${report.id}`,
-                    })
-                    const html = unsubToken ? injectUnsub(template.html, unsubToken, appUrl) : template.html
-                    await resend.emails.send({ from, to: partner.contact_email, subject: template.subject, html })
+                    }, prefsUrl(unsubToken, appUrl))
+                    await resend.emails.send({ from, to: partner.contact_email, subject: template.subject, html: template.html })
                     totalSent++
                   } catch (err) {
                     console.error(`[cron] Failed to send report reminder to ${partner.contact_email}:`, err)
@@ -574,7 +581,7 @@ async function runCollabReminders(
                 }
                 if (!skipEmail) {
                   try {
-                    const template = collabDeliverableReminderEmail({
+                    const template = renderEmail(collabDeliverableReminderEmail, {
                       contactName: partner.contact_name || '',
                       orgName: partner.org_name,
                       projectAcronym: proj.acronym,
@@ -583,9 +590,8 @@ async function runCollabReminders(
                       dueMonth: del.due_month,
                       dueDate: dueDate.toISOString().split('T')[0],
                       projectUrl: `${appUrl}/projects/collaboration/${proj.id}`,
-                    })
-                    const html = unsubToken ? injectUnsub(template.html, unsubToken, appUrl) : template.html
-                    await resend.emails.send({ from, to: partner.contact_email, subject: template.subject, html })
+                    }, prefsUrl(unsubToken, appUrl))
+                    await resend.emails.send({ from, to: partner.contact_email, subject: template.subject, html: template.html })
                     totalSent++
                   } catch (err) {
                     console.error(`[cron] Failed to send deliverable reminder to ${partner.contact_email}:`, err)
@@ -652,7 +658,7 @@ async function runCollabReminders(
                 }
                 if (!skipEmail) {
                   try {
-                    const template = collabMilestoneReminderEmail({
+                    const template = renderEmail(collabMilestoneReminderEmail, {
                       contactName: coordPartner.contact_name || '',
                       orgName: coordPartner.org_name,
                       projectAcronym: proj.acronym,
@@ -661,9 +667,8 @@ async function runCollabReminders(
                       dueMonth: ms.due_month,
                       dueDate: dueDate.toISOString().split('T')[0],
                       projectUrl: `${appUrl}/projects/collaboration/${proj.id}`,
-                    })
-                    const html = unsubToken ? injectUnsub(template.html, unsubToken, appUrl) : template.html
-                    await resend.emails.send({ from, to: coordPartner.contact_email, subject: template.subject, html })
+                    }, prefsUrl(unsubToken, appUrl))
+                    await resend.emails.send({ from, to: coordPartner.contact_email, subject: template.subject, html: template.html })
                     totalSent++
                   } catch (err) {
                     console.error(`[cron] Failed to send milestone reminder to ${coordPartner.contact_email}:`, err)

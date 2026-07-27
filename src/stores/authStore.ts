@@ -43,6 +43,24 @@ interface AuthState {
 
 let initialized = false
 
+/**
+ * True when the current session is only aal1 but the account requires aal2 —
+ * i.e. the password step succeeded and the TOTP step has not been completed.
+ *
+ * Fails CLOSED: if the AAL check itself errors we assume verification is
+ * pending rather than letting an unverified session through.
+ */
+async function mfaVerificationPending(): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
+    if (error) return true
+    if (!data) return false
+    return data.currentLevel === 'aal1' && data.nextLevel === 'aal2'
+  } catch {
+    return true
+  }
+}
+
 export const useAuthStore = create<AuthState>((set, get) => ({
   user: null,
   orgId: null,
@@ -78,6 +96,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
       if (!session?.user) {
         set({ isLoading: false, user: null })
+      } else if (await mfaVerificationPending()) {
+        // ── MFA BYPASS FIX ──────────────────────────────────────────────────
+        // signInWithPassword issues a real (aal1) session BEFORE the TOTP code
+        // is entered, and that session is persisted to localStorage. The
+        // onAuthStateChange handler below checked for this, but initialize()
+        // — which runs on every page load — did not. So a user could type
+        // their password, reach the MFA prompt, press F5, and be let straight
+        // in without ever entering a code.
+        //
+        // Treat a pending aal2 step as "not signed in" and send them back to
+        // the login screen to complete the challenge.
+        await supabase.auth.signOut()
+        set({ isLoading: false, user: null })
       } else {
         await loadUserContext(session.user, set)
       }
@@ -95,12 +126,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         // Also check AAL level: if user has MFA enrolled but only AAL1,
         // they still need to verify. Skip loading context to prevent
         // the dashboard from flashing before the MFA prompt appears.
-        try {
-          const { data: aalData } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
-          if (aalData && aalData.currentLevel === 'aal1' && aalData.nextLevel === 'aal2') {
-            return // MFA verification pending — signIn() will handle it
-          }
-        } catch { /* ignore — proceed normally if AAL check fails */ }
+        if (await mfaVerificationPending()) {
+          return // MFA verification pending — signIn() will handle it
+        }
 
         // Only reload context if user changed (avoid duplicate on init)
         const current = get().user
@@ -326,12 +354,25 @@ async function loadUserContext(
   user: User,
   set: (state: Partial<AuthState>) => void,
 ) {
-  // Try org_members first
-  const { data: member, error: memberError } = await supabase
+  // Try org_members first.
+  //
+  // NOTE: this used to be `.maybeSingle()`, which THROWS when more than one
+  // row matches. Any user who ended up in two organisations — which the invite
+  // flow can do to someone who already has their own account — got an error
+  // here, fell through to the collab check, and was dumped into the onboarding
+  // wizard, locked out of their own company.
+  //
+  // Order by created_at so the resolved organisation matches the one
+  // auth_org_id() picks in the database. See BACKLOG.md B20 for the real
+  // multi-org support work.
+  const { data: memberRows, error: memberError } = await supabase
     .from('org_members')
-    .select('org_id, role')
+    .select('org_id, role, created_at')
     .eq('user_id', user.id)
-    .maybeSingle()
+    .order('created_at', { ascending: true })
+    .limit(1)
+
+  const member = memberRows?.[0] ?? null
 
   // Log query errors but do NOT bootstrap as admin — fall through to collab check
   if (memberError) {

@@ -1,29 +1,38 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { createClient } from '@supabase/supabase-js'
+import type { SupabaseClient } from '@supabase/supabase-js'
 import crypto from 'crypto'
-import { cors, authenticateRequest, handleAuthError } from './lib/auth.js'
+import {
+  cors,
+  authenticateRequest,
+  requireOrgAdmin,
+  requireOrgMember,
+  handleAuthError,
+  adminClient,
+  type AuthContext,
+} from './lib/auth.js'
 import { checkRateLimit } from './lib/rateLimit.js'
+import { appUrl } from './lib/appUrl.js'
 
 /**
- * Consolidated members API — replaces invite-member, resolve-emails, collab-invite.
+ * Consolidated members API.
  *
- * POST /api/members?action=invite-member
- * POST /api/members?action=resolve-emails
- * POST /api/members?action=collab-send
- * POST /api/members?action=collab-accept
- * POST /api/members?action=collab-lookup
+ * POST /api/members?action=invite-member    — Admin of the target org only
+ * POST /api/members?action=resolve-emails   — members of the caller's org only
+ * POST /api/members?action=collab-send      — member of the project's org only
+ * POST /api/members?action=collab-accept    — authenticated; binds to the JWT
+ * POST /api/members?action=collab-lookup    — public (invite preview)
+ *
+ * SECURITY MODEL
+ * --------------
+ * Authentication answers "who is this". It is NOT enough on its own. Every
+ * handler below that receives an id in the request body must additionally
+ * prove the caller has access to THAT organisation — otherwise a logged-in
+ * user of company A can act on company B simply by pasting B's uuid.
  */
 
-function getSupabase() {
-  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!supabaseUrl || !serviceKey) return null
-  return { client: createClient(supabaseUrl, serviceKey), url: supabaseUrl }
-}
-
 // Only collab-lookup is truly public — it previews the invite before the user
-// signs in. collab-accept now requires the user to be authenticated so we can
-// bind the partner row to the JWT's userId (not a self-declared body field).
+// signs in. collab-accept requires authentication so we can bind the partner
+// row to the JWT's userId (not a self-declared body field).
 const PUBLIC_ACTIONS = ['collab-lookup']
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -35,38 +44,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   // Rate limits: slower on the invite-token endpoints to blunt brute-force,
   // but not so slow that a user refreshing the invite page a few times trips
-  // the limit. 20 / 60 s = 3 seconds between requests on average — fine for
-  // real users, still orders of magnitude slower than a brute-force attempt.
+  // the limit.
   if (action === 'collab-lookup' || action === 'collab-accept') {
     if (!checkRateLimit(req, res, { limit: 20, windowSeconds: 60, prefix: 'members-invite' })) return
   } else {
     if (!checkRateLimit(req, res, { limit: 30, windowSeconds: 60, prefix: 'members' })) return
   }
 
-  // Require JWT for non-public actions — and forward the authenticated user
-  // context to handlers that need it.
-  let authContext: Awaited<ReturnType<typeof authenticateRequest>> | null = null
-  if (!PUBLIC_ACTIONS.includes(action)) {
-    try {
-      authContext = await authenticateRequest(req)
-    } catch (err) {
-      return handleAuthError(err, res)
+  try {
+    let auth: AuthContext | null = null
+    if (!PUBLIC_ACTIONS.includes(action)) {
+      auth = await authenticateRequest(req)
     }
-  }
 
-  switch (action) {
-    case 'invite-member':
-      return handleInviteMember(req, res)
-    case 'resolve-emails':
-      return handleResolveEmails(req, res)
-    case 'collab-send':
-      return handleCollabSend(req, res)
-    case 'collab-accept':
-      return handleCollabAccept(req, res, authContext!)
-    case 'collab-lookup':
-      return handleCollabLookup(req, res)
-    default:
-      return res.status(400).json({ error: `Unknown action: "${action}"` })
+    const sb = adminClient()
+
+    switch (action) {
+      case 'invite-member':
+        return await handleInviteMember(req, res, sb, auth!)
+      case 'resolve-emails':
+        return await handleResolveEmails(req, res, sb, auth!)
+      case 'collab-send':
+        return await handleCollabSend(req, res, sb, auth!)
+      case 'collab-accept':
+        return await handleCollabAccept(req, res, sb, auth!)
+      case 'collab-lookup':
+        return await handleCollabLookup(req, res, sb)
+      default:
+        return res.status(400).json({ error: `Unknown action: "${action}"` })
+    }
+  } catch (err) {
+    return handleAuthError(err, res)
   }
 }
 
@@ -74,52 +82,57 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 // invite-member
 // ════════════════════════════════════════════════════════════════════════════
 
-async function handleInviteMember(req: VercelRequest, res: VercelResponse) {
-  const sb = getSupabase()
-  if (!sb) {
-    return res.status(500).json({
-      error: 'Server configuration error: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY',
-    })
+const ASSIGNABLE_ROLES = ['Admin', 'Project Manager', 'Finance Officer', 'Viewer', 'External Participant']
+
+async function handleInviteMember(
+  req: VercelRequest,
+  res: VercelResponse,
+  sb: SupabaseClient,
+  auth: AuthContext,
+) {
+  const { email, orgId, role, personId } = req.body ?? {}
+
+  // AUTHORIZATION — without this, any authenticated user could add themselves
+  // (or anyone) as Admin of any organisation whose uuid they knew.
+  requireOrgAdmin(auth, orgId)
+
+  if (!email || typeof email !== 'string' || !role) {
+    return res.status(400).json({ error: 'Missing required fields: email, orgId, role' })
+  }
+  if (!ASSIGNABLE_ROLES.includes(role)) {
+    return res.status(400).json({ error: `Invalid role. Must be one of: ${ASSIGNABLE_ROLES.join(', ')}` })
   }
 
-  const { email, orgId, role, invitedBy, personId } = req.body ?? {}
-  if (!email || !orgId || !role) {
-    return res.status(400).json({ error: 'Missing required fields: email, orgId, role' })
+  const normalisedEmail = email.trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalisedEmail)) {
+    return res.status(400).json({ error: 'Invalid email address' })
   }
 
   try {
-    let userId: string | null = null
-    let isNewUser = false
+    // Look the user up in the database rather than paging listUsers(), which
+    // silently stopped working past 1,000 users.
+    const { data: existingId, error: lookupErr } = await sb
+      .rpc('find_user_id_by_email', { p_email: normalisedEmail })
 
-    const { data: listData, error: listErr } = await sb.client.auth.admin.listUsers({ perPage: 1000 })
-
-    if (listErr) {
-      return res.status(500).json({
-        error: 'Failed to list users. Check that SUPABASE_SERVICE_ROLE_KEY is correct.',
-        detail: listErr.message,
-      })
+    if (lookupErr) {
+      console.error('[GrantLume] invite-member: user lookup failed:', lookupErr.message)
+      return res.status(500).json({ error: 'Failed to look up user account' })
     }
 
-    const existing = (listData?.users as any[])?.find(
-      (u) => u.email?.toLowerCase() === email.toLowerCase(),
-    )
+    let userId: string | null = (existingId as string | null) ?? null
+    let isNewUser = false
 
-    if (existing) {
-      userId = existing.id
-    } else {
+    if (!userId) {
       const tempPassword = crypto.randomBytes(24).toString('base64url')
-
-      const { data: created, error: createErr } = await sb.client.auth.admin.createUser({
-        email,
+      const { data: created, error: createErr } = await sb.auth.admin.createUser({
+        email: normalisedEmail,
         password: tempPassword,
         email_confirm: true,
       })
 
       if (createErr) {
-        return res.status(500).json({
-          error: 'Failed to create user account',
-          detail: createErr.message,
-        })
+        console.error('[GrantLume] invite-member: createUser failed:', createErr.message)
+        return res.status(500).json({ error: 'Failed to create user account' })
       }
 
       userId = created?.user?.id ?? null
@@ -130,8 +143,8 @@ async function handleInviteMember(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: 'Could not resolve user ID' })
     }
 
-    // Check if already a member
-    const { data: existingMember } = await sb.client
+    // Already a member?
+    const { data: existingMember } = await sb
       .from('org_members')
       .select('id')
       .eq('org_id', orgId)
@@ -142,35 +155,34 @@ async function handleInviteMember(req: VercelRequest, res: VercelResponse) {
       return res.status(409).json({ error: 'User is already a member of this organisation' })
     }
 
-    // Insert org_members row
-    const { error: insertErr } = await sb.client.from('org_members').insert({
+    // The inviter is taken from the verified JWT, never from the body.
+    const { error: insertErr } = await sb.from('org_members').insert({
       user_id: userId,
       org_id: orgId,
       role,
-      invited_by: invitedBy ?? null,
+      invited_by: auth.userId,
     })
 
     if (insertErr) {
-      return res.status(500).json({
-        error: 'Failed to add member to organisation',
-        detail: insertErr.message,
-      })
+      console.error('[GrantLume] invite-member: membership insert failed:', insertErr.message)
+      return res.status(500).json({ error: 'Failed to add member to organisation' })
     }
 
-    // Link person record if personId provided
-    if (personId) {
-      await sb.client.from('persons').update({
+    // Link the person record — scoped to the same organisation so a person id
+    // from another company cannot be hijacked.
+    if (personId && typeof personId === 'string') {
+      await sb.from('persons').update({
         user_id: userId,
         invite_status: 'pending',
         invite_role: role,
         updated_at: new Date().toISOString(),
-      }).eq('id', personId)
+      }).eq('id', personId).eq('org_id', orgId)
     }
 
     return res.status(200).json({ success: true, userId, isNewUser })
   } catch (err: any) {
     console.error('[GrantLume] invite-member failed:', err)
-    return res.status(500).json({ error: err.message || 'Internal error' })
+    return res.status(500).json({ error: 'Internal error' })
   }
 }
 
@@ -178,31 +190,56 @@ async function handleInviteMember(req: VercelRequest, res: VercelResponse) {
 // resolve-emails
 // ════════════════════════════════════════════════════════════════════════════
 
-async function handleResolveEmails(req: VercelRequest, res: VercelResponse) {
-  const sb = getSupabase()
-  if (!sb) {
-    return res.status(500).json({ error: 'Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars' })
-  }
+async function handleResolveEmails(
+  req: VercelRequest,
+  res: VercelResponse,
+  sb: SupabaseClient,
+  auth: AuthContext,
+) {
+  const { userIds, orgId } = req.body ?? {}
 
-  const { userIds } = req.body ?? {}
+  // AUTHORIZATION — this endpoint used to accept any user ids at all and hand
+  // back their email addresses, which made it a directory-enumeration tool.
+  requireOrgMember(auth, orgId)
+
   if (!Array.isArray(userIds) || userIds.length === 0) {
     return res.status(400).json({ error: 'Missing required field: userIds (array)' })
   }
+  if (userIds.length > 200) {
+    return res.status(400).json({ error: 'Too many userIds (max 200)' })
+  }
+  const requested = userIds.filter((id: unknown): id is string => typeof id === 'string')
 
   try {
-    const { data: listData } = await sb.client.auth.admin.listUsers({ perPage: 1000 })
-    const users = listData?.users ?? []
+    // Intersect the request with the caller's own organisation. Ids outside it
+    // are dropped silently rather than reported, so this cannot be used to test
+    // whether a given user exists.
+    const { data: members } = await sb
+      .from('org_members')
+      .select('user_id')
+      .eq('org_id', orgId)
+      .in('user_id', requested)
+
+    const allowedIds = (members ?? []).map((m: any) => m.user_id)
+    if (allowedIds.length === 0) {
+      return res.status(200).json({ emails: {} })
+    }
+
+    const { data: rows, error } = await sb.rpc('get_user_emails', { p_user_ids: allowedIds })
+    if (error) {
+      console.error('[GrantLume] resolve-emails failed:', error.message)
+      return res.status(500).json({ error: 'Failed to resolve emails' })
+    }
 
     const emails: Record<string, string> = {}
-    for (const uid of userIds) {
-      const u = users.find((x: any) => x.id === uid)
-      if (u?.email) emails[uid] = u.email
+    for (const row of (rows ?? []) as { user_id: string; email: string | null }[]) {
+      if (row.email) emails[row.user_id] = row.email
     }
 
     return res.status(200).json({ emails })
   } catch (err: any) {
     console.error('[GrantLume] resolve-emails failed:', err)
-    return res.status(500).json({ error: err.message || 'Internal error' })
+    return res.status(500).json({ error: 'Internal error' })
   }
 }
 
@@ -221,20 +258,18 @@ async function handleResolveEmails(req: VercelRequest, res: VercelResponse) {
 async function handleCollabAccept(
   req: VercelRequest,
   res: VercelResponse,
-  auth: Awaited<ReturnType<typeof authenticateRequest>>,
+  sb: SupabaseClient,
+  auth: AuthContext,
 ) {
-  const sb = getSupabase()
-  if (!sb) return res.status(500).json({ error: 'Server configuration error' })
-
   const { token } = req.body ?? {}
-  if (!token) return res.status(400).json({ error: 'Missing token' })
+  if (!token || typeof token !== 'string') return res.status(400).json({ error: 'Missing token' })
   if (!auth?.userId) return res.status(401).json({ error: 'Not authenticated' })
 
   // Look in both project_partners and proposal_partners.
   let context: 'project' | 'proposal' | null = null
   let partner: any = null
   {
-    const { data } = await sb.client
+    const { data } = await sb
       .from('project_partners')
       .select('id, project_id, org_name, invite_status, user_id')
       .eq('invite_token', token)
@@ -242,7 +277,7 @@ async function handleCollabAccept(
     if (data) { partner = data; context = 'project' }
   }
   if (!partner) {
-    const { data } = await sb.client
+    const { data } = await sb
       .from('proposal_partners')
       .select('id, proposal_id, org_name, invite_status, user_id')
       .eq('invite_token', token)
@@ -279,14 +314,20 @@ async function handleCollabAccept(
   }
 
   const tableName = context === 'project' ? 'project_partners' : 'proposal_partners'
-  const { error: updateErr } = await sb.client
+  const { data: updated, error: updateErr } = await sb
     .from(tableName)
     .update(updateData)
     .eq('id', partner.id)
     .eq('invite_status', 'pending')
+    .select('id')
 
   if (updateErr) {
-    return res.status(500).json({ error: 'Failed to accept invitation', detail: updateErr.message })
+    console.error('[GrantLume] collab-accept update failed:', updateErr.message)
+    return res.status(500).json({ error: 'Failed to accept invitation' })
+  }
+  // Zero rows means someone else accepted between our read and our write.
+  if (!updated || updated.length === 0) {
+    return res.status(409).json({ error: 'This invitation has already been used' })
   }
 
   return res.status(200).json({
@@ -303,41 +344,50 @@ async function handleCollabAccept(
 // collab-send
 // ════════════════════════════════════════════════════════════════════════════
 
-async function handleCollabSend(req: VercelRequest, res: VercelResponse) {
-  const sb = getSupabase()
-  if (!sb) return res.status(500).json({ error: 'Server configuration error' })
+async function handleCollabSend(
+  req: VercelRequest,
+  res: VercelResponse,
+  sb: SupabaseClient,
+  auth: AuthContext,
+) {
+  const { projectId } = req.body ?? {}
+  if (!projectId || typeof projectId !== 'string') {
+    return res.status(400).json({ error: 'Missing projectId' })
+  }
 
-  const { projectId, senderName } = req.body
-  if (!projectId) return res.status(400).json({ error: 'Missing projectId' })
-
-  const { data: project, error: projErr } = await sb.client
+  const { data: project, error: projErr } = await sb
     .from('projects')
-    .select('acronym, title')
+    .select('id, org_id, acronym, title')
     .eq('id', projectId)
-    .single()
+    .maybeSingle()
 
   if (projErr || !project) {
     return res.status(404).json({ error: 'Project not found' })
   }
 
-  const { data: partners, error: partErr } = await sb.client
+  // AUTHORIZATION — resolve the org from the project, then check membership.
+  requireOrgMember(auth, (project as any).org_id)
+
+  const { data: partners, error: partErr } = await sb
     .from('project_partners')
     .select('id, org_name, contact_email, invite_token, invite_status')
     .eq('project_id', projectId)
     .eq('invite_status', 'pending')
 
   if (partErr) {
-    return res.status(500).json({ error: 'Failed to fetch partners', detail: partErr.message })
+    return res.status(500).json({ error: 'Failed to fetch partners' })
   }
 
-  const baseUrl = process.env.VITE_APP_URL || process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : 'http://localhost:5173'
+  // The base URL used to be built with a precedence bug that produced
+  // "https://undefined/collab/accept" whenever VITE_APP_URL was set but
+  // VERCEL_URL was not. appUrl() resolves it correctly in one place.
+  const inviteBaseUrl = `${appUrl()}/collab/accept`
 
+  const pending = partners ?? []
   const sent: string[] = []
   const skipped: string[] = []
 
-  for (const p of partners ?? []) {
+  for (const p of pending) {
     if (!p.contact_email) {
       skipped.push(p.org_name)
       continue
@@ -345,34 +395,42 @@ async function handleCollabSend(req: VercelRequest, res: VercelResponse) {
     sent.push(p.org_name)
   }
 
+  // NOTE: this endpoint deliberately does NOT send email itself — the client
+  // sends the branded template through /api/send-email once it has the tokens.
+  // Previously it returned `sent` without sending anything and without giving
+  // the caller the tokens, so the UI reported success for a no-op.
   return res.status(200).json({
     success: true,
     sent,
     skipped,
-    totalPending: (partners ?? []).length,
-    inviteBaseUrl: `${baseUrl}/collab/accept`,
+    totalPending: pending.length,
+    inviteBaseUrl,
+    invites: pending
+      .filter(p => !!p.contact_email)
+      .map(p => ({
+        partnerId: p.id,
+        orgName: p.org_name,
+        contactEmail: p.contact_email,
+        inviteUrl: `${inviteBaseUrl}?token=${encodeURIComponent(p.invite_token)}`,
+      })),
   })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// collab-lookup
+// collab-lookup  (public — previews an invite before sign-in)
 // ════════════════════════════════════════════════════════════════════════════
 
-async function handleCollabLookup(req: VercelRequest, res: VercelResponse) {
-  const sb = getSupabase()
-  if (!sb) return res.status(500).json({ error: 'Server configuration error' })
-
-  const { token } = req.body
-  if (!token) return res.status(400).json({ error: 'Missing token' })
+async function handleCollabLookup(req: VercelRequest, res: VercelResponse, sb: SupabaseClient) {
+  const { token } = req.body ?? {}
+  if (!token || typeof token !== 'string') return res.status(400).json({ error: 'Missing token' })
 
   // Look up the token in BOTH project_partners and proposal_partners —
   // the same invite token can belong to either context. First hit wins.
   let partner: any = null
   let context: 'project' | 'proposal' | null = null
-  let error: any = null
 
   {
-    const { data } = await sb.client
+    const { data } = await sb
       .from('project_partners')
       .select(`
         id, org_name, invite_status, role, participant_number,
@@ -387,7 +445,7 @@ async function handleCollabLookup(req: VercelRequest, res: VercelResponse) {
   }
 
   if (!partner) {
-    const { data, error: propErr } = await sb.client
+    const { data } = await sb
       .from('proposal_partners')
       .select(`
         id, org_name, invite_status, role, participant_number,
@@ -399,16 +457,12 @@ async function handleCollabLookup(req: VercelRequest, res: VercelResponse) {
       partner = data
       context = 'proposal'
     }
-    error = propErr
   }
 
-  if (error || !partner || !context) {
+  if (!partner || !context) {
     return res.status(404).json({ error: 'Invitation not found' })
   }
 
-  // Shape the response with a `context` field plus legacy aliases the
-  // existing UI still reads. Both `project` and `proposal` may be present
-  // as nested objects on the partner — whichever one matched.
   const shaped = {
     ...partner,
     context,

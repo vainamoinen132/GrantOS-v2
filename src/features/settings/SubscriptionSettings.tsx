@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '@/stores/authStore'
+import { apiFetch } from '@/lib/apiClient'
 import { settingsService } from '@/services/settingsService'
 import { aiUsageService } from '@/services/aiUsageService'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
@@ -133,12 +134,12 @@ export function SubscriptionSettings() {
     if (!orgId || !user?.email) return
     setUpgrading(true)
     try {
-      const resp = await fetch('/api/stripe?action=create-checkout', {
+      // apiFetch attaches the Supabase JWT — the endpoint verifies the caller
+      // is an Admin of this organisation before touching Stripe.
+      const resp = await apiFetch('/api/stripe?action=create-checkout', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           org_id: orgId,
-          user_email: user.email,
           billing_interval: billingInterval,
           promo_code: promoCode.trim() || undefined,
         }),
@@ -165,9 +166,8 @@ export function SubscriptionSettings() {
     if (!orgId) return
     setManagingBilling(true)
     try {
-      const resp = await fetch('/api/stripe?action=create-portal', {
+      const resp = await apiFetch('/api/stripe?action=create-portal', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ org_id: orgId }),
       })
       const data = await resp.json()

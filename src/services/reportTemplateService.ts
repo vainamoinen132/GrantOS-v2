@@ -395,8 +395,10 @@ async function fetchProjects(orgId: string, config: ReportConfig): Promise<Repor
 }
 
 async function fetchStaff(orgId: string, config: ReportConfig): Promise<ReportRow[]> {
-  const { data, error } = await supabase
-    .from('persons')
+  // persons_secure returns annual_salary only when the caller has the
+  // can_see_salary permission; otherwise it comes back NULL.
+  const { data, error } = await (supabase as any)
+    .from('persons_secure')
     .select('*')
     .eq('org_id', orgId)
     .order('full_name')
@@ -415,9 +417,9 @@ async function fetchStaff(orgId: string, config: ReportConfig): Promise<ReportRo
     is_active: p.is_active ? 'Yes' : 'No',
     vacation_days_per_year: p.vacation_days_per_year ?? 0,
   }))
-  if (config.filters.department) rows = rows.filter(r => r.department === config.filters.department)
-  if (config.filters.employment_type) rows = rows.filter(r => r.employment_type === config.filters.employment_type)
-  if (config.filters.is_active) rows = rows.filter(r => r.is_active === (config.filters.is_active === 'true' ? 'Yes' : 'No'))
+  if (config.filters.department) rows = rows.filter((r: ReportRow) => r.department === config.filters.department)
+  if (config.filters.employment_type) rows = rows.filter((r: ReportRow) => r.employment_type === config.filters.employment_type)
+  if (config.filters.is_active) rows = rows.filter((r: ReportRow) => r.is_active === (config.filters.is_active === 'true' ? 'Yes' : 'No'))
   return rows
 }
 

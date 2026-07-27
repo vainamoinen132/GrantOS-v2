@@ -19,11 +19,16 @@ export function IntegrationsSettings() {
   const [integrationKey, setIntegrationKey] = useState('')
   const [userId, setUserId] = useState('')
   const [accountId, setAccountId] = useState('')
+  // WRITE-ONLY. The RSA private key is a signing credential; SELECT on that
+  // column is revoked at the database level, so it is never sent to the
+  // browser. This field starts empty and is only submitted when the admin
+  // actually types a new key. `keyConfigured` reflects whether one is stored.
   const [rsaPrivateKey, setRsaPrivateKey] = useState('')
+  const [keyConfigured, setKeyConfigured] = useState(false)
   const [baseUrl, setBaseUrl] = useState('https://demo.docusign.net/restapi')
   const [oauthBaseUrl, setOauthBaseUrl] = useState('https://account-d.docusign.com')
 
-  const isConfigured = !!(integrationKey && userId && accountId && rsaPrivateKey)
+  const isConfigured = !!(integrationKey && userId && accountId && (keyConfigured || rsaPrivateKey))
 
   useEffect(() => {
     if (!orgId) return
@@ -33,7 +38,7 @@ export function IntegrationsSettings() {
         setIntegrationKey(org.docusign_integration_key ?? '')
         setUserId(org.docusign_user_id ?? '')
         setAccountId(org.docusign_account_id ?? '')
-        setRsaPrivateKey(org.docusign_rsa_private_key ?? '')
+        setKeyConfigured(!!(org as { docusign_key_configured?: boolean }).docusign_key_configured)
         setBaseUrl(org.docusign_base_url ?? 'https://demo.docusign.net/restapi')
         setOauthBaseUrl(org.docusign_oauth_base_url ?? 'https://account-d.docusign.com')
       }
@@ -50,13 +55,35 @@ export function IntegrationsSettings() {
         docusign_integration_key: integrationKey || null,
         docusign_user_id: userId || null,
         docusign_account_id: accountId || null,
-        docusign_rsa_private_key: rsaPrivateKey || null,
+        // Only send the key when a new one was typed — an empty field means
+        // "leave the stored key alone", not "delete it".
+        ...(rsaPrivateKey ? { docusign_rsa_private_key: rsaPrivateKey } : {}),
         docusign_base_url: baseUrl || null,
         docusign_oauth_base_url: oauthBaseUrl || null,
       })
+      if (rsaPrivateKey) {
+        setKeyConfigured(true)
+        setRsaPrivateKey('')
+      }
       toast({ title: 'DocuSign settings saved', description: 'The integration is now active for your organisation.' })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to save'
+      toast({ title: 'Error', description: message, variant: 'destructive' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleClearKey = async () => {
+    if (!orgId) return
+    setSaving(true)
+    try {
+      await settingsService.updateOrganisation(orgId, { docusign_rsa_private_key: null })
+      setKeyConfigured(false)
+      setRsaPrivateKey('')
+      toast({ title: 'Private key removed', description: 'DocuSign signing is disabled until a new key is saved.' })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to remove the key'
       toast({ title: 'Error', description: message, variant: 'destructive' })
     } finally {
       setSaving(false)
@@ -151,17 +178,41 @@ export function IntegrationsSettings() {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <Label htmlFor="ds-rsa-key">RSA Private Key</Label>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-6 px-2 text-xs"
-                onClick={() => setShowKey(!showKey)}
-              >
-                {showKey ? <EyeOff className="h-3 w-3 mr-1" /> : <Eye className="h-3 w-3 mr-1" />}
-                {showKey ? 'Hide' : 'Show'}
-              </Button>
+              <div className="flex items-center gap-1">
+                {keyConfigured && !rsaPrivateKey && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2 py-0.5 text-[11px] font-medium text-green-700 ring-1 ring-green-200">
+                    <CheckCircle2 className="h-3 w-3" />
+                    Key saved
+                  </span>
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  onClick={() => setShowKey(!showKey)}
+                >
+                  {showKey ? <EyeOff className="h-3 w-3 mr-1" /> : <Eye className="h-3 w-3 mr-1" />}
+                  {showKey ? 'Hide' : 'Show'}
+                </Button>
+                {keyConfigured && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-xs text-destructive"
+                    disabled={saving}
+                    onClick={handleClearKey}
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
             </div>
+            <p className="text-xs text-muted-foreground">
+              For security, a saved key is never sent back to the browser. Leave this blank to
+              keep the existing key, or paste a new one to replace it.
+            </p>
             {showKey ? (
               <textarea
                 id="ds-rsa-key"
@@ -177,7 +228,7 @@ export function IntegrationsSettings() {
                 type="password"
                 value={rsaPrivateKey}
                 onChange={(e) => setRsaPrivateKey(e.target.value)}
-                placeholder={rsaPrivateKey ? '••••••••••••••••' : 'Paste your RSA private key here'}
+                placeholder={keyConfigured ? '•••••••••• (key saved — paste to replace)' : 'Paste your RSA private key here'}
               />
             )}
             <p className="text-xs text-muted-foreground">

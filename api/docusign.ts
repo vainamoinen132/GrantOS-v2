@@ -1,15 +1,31 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { createClient } from '@supabase/supabase-js'
 import { Resend } from 'resend'
-import { cors, authenticateRequest, handleAuthError } from './lib/auth.js'
+import {
+  cors,
+  authenticateRequest,
+  requireOrgMember,
+  handleAuthError,
+  adminClient,
+  type AuthContext,
+} from './lib/auth.js'
 import { checkRateLimit } from './lib/rateLimit.js'
+import { readRawBody, parseJsonBody, BodyError } from './lib/rawBody.js'
+import { appUrl } from './lib/appUrl.js'
+import { escapeHtml } from './lib/html.js'
 
 /**
  * POST /api/docusign?action=sign     — Create DocuSign envelope for signing
  * POST /api/docusign?action=webhook  — DocuSign Connect webhook callback
  *
  * Consolidated into one serverless function to stay within Vercel Hobby plan limits.
+ *
+ * The body parser is disabled so the webhook can verify DocuSign's HMAC
+ * against the exact bytes it sent — see api/lib/rawBody.ts.
  */
+
+export const config = {
+  api: { bodyParser: false },
+}
 
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December']
 
@@ -23,22 +39,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const action = (req.query.action as string) || ''
 
-  // Webhook is called by DocuSign servers — no JWT auth, uses its own verification
-  if (action === 'sign') {
-    try {
-      await authenticateRequest(req)
-    } catch (err) {
-      return handleAuthError(err, res)
+  try {
+    switch (action) {
+      case 'sign': {
+        // Webhooks are called by DocuSign and verified by HMAC. Everything
+        // else is a user action and needs a JWT plus an organisation check.
+        const auth = await authenticateRequest(req)
+        return await handleSign(req, res, auth)
+      }
+      case 'webhook':
+        return await handleWebhook(req, res)
+      default:
+        return res.status(400).json({ error: `Unknown action: "${action}". Use ?action=sign or ?action=webhook` })
     }
-  }
-
-  switch (action) {
-    case 'sign':
-      return handleSign(req, res)
-    case 'webhook':
-      return handleWebhook(req, res)
-    default:
-      return res.status(400).json({ error: `Unknown action: "${action}". Use ?action=sign or ?action=webhook` })
+  } catch (err) {
+    if (err instanceof BodyError) {
+      return res.status(err.status).json({ error: err.message })
+    }
+    return handleAuthError(err, res)
   }
 }
 
@@ -89,7 +107,7 @@ async function getDocuSignAccessToken(config: DocuSignConfig): Promise<string> {
     throw new Error(`DocuSign OAuth failed: ${tokenRes.status} — ${errText}`)
   }
 
-  const tokenData = await tokenRes.json()
+  const tokenData = await tokenRes.json() as any
   return tokenData.access_token
 }
 
@@ -111,12 +129,14 @@ function buildTimesheetHtml(params: {
 
   const sortedDates = Array.from(dayMap.keys()).sort()
 
+  // This HTML becomes a legally signed document — every interpolated value is
+  // escaped so a project or person name can never inject markup into it.
   const rows = sortedDates.map(date => {
     const entries = dayMap.get(date)!
     return entries.map((e, i) => `
       <tr style="border-bottom:1px solid #e5e7eb;">
-        ${i === 0 ? `<td rowspan="${entries.length}" style="padding:6px 10px;font-size:13px;vertical-align:top;">${date}</td>` : ''}
-        <td style="padding:6px 10px;font-size:13px;">${e.project}${e.wp ? ` / ${e.wp}` : ''}</td>
+        ${i === 0 ? `<td rowspan="${entries.length}" style="padding:6px 10px;font-size:13px;vertical-align:top;">${escapeHtml(date)}</td>` : ''}
+        <td style="padding:6px 10px;font-size:13px;">${escapeHtml(e.project)}${e.wp ? ` / ${escapeHtml(e.wp)}` : ''}</td>
         <td style="padding:6px 10px;font-size:13px;text-align:right;">${e.hours.toFixed(1)}h</td>
       </tr>
     `).join('')
@@ -127,11 +147,11 @@ function buildTimesheetHtml(params: {
     <body style="font-family:Arial,Helvetica,sans-serif;color:#1f2937;margin:40px;">
       <div style="margin-bottom:30px;">
         <h1 style="font-size:20px;margin:0;">Monthly Timesheet</h1>
-        <p style="font-size:14px;color:#6b7280;margin:4px 0 0;">${params.orgName}</p>
+        <p style="font-size:14px;color:#6b7280;margin:4px 0 0;">${escapeHtml(params.orgName)}</p>
       </div>
       <table style="font-size:13px;margin-bottom:20px;">
-        <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Employee:</td><td>${params.personName}</td></tr>
-        <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Period:</td><td>${params.month} ${params.year}</td></tr>
+        <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Employee:</td><td>${escapeHtml(params.personName)}</td></tr>
+        <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Period:</td><td>${escapeHtml(params.month)} ${params.year}</td></tr>
         <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Working Days:</td><td>${params.workingDays}</td></tr>
         <tr><td style="padding:3px 16px 3px 0;font-weight:600;">Total Hours:</td><td>${params.totalHours.toFixed(1)}h</td></tr>
       </table>
@@ -176,24 +196,39 @@ function buildTimesheetHtml(params: {
   `
 }
 
-async function handleSign(req: VercelRequest, res: VercelResponse) {
-  const { orgId, personId, year, month, userId } = req.body || {}
-  if (!orgId || !personId || !year || !month) {
-    return res.status(400).json({ error: 'Missing orgId, personId, year, or month' })
+async function handleSign(req: VercelRequest, res: VercelResponse, auth: AuthContext) {
+  const body = await parseJsonBody(req)
+  const { orgId, personId, year, month } = body || {}
+
+  // AUTHORIZATION — orgId and personId arrive from the client. Without this
+  // check any authenticated user could pass another company's ids and receive
+  // an embedded signing URL for someone else's timesheet, signed with that
+  // company's DocuSign credentials.
+  requireOrgMember(auth, orgId)
+
+  if (!personId || typeof personId !== 'string') {
+    return res.status(400).json({ error: 'Missing personId' })
+  }
+  const yearNum = Number(year)
+  const monthNum = Number(month)
+  if (!Number.isInteger(yearNum) || yearNum < 2000 || yearNum > 2100) {
+    return res.status(400).json({ error: 'Invalid year' })
+  }
+  if (!Number.isInteger(monthNum) || monthNum < 1 || monthNum > 12) {
+    return res.status(400).json({ error: 'Invalid month' })
   }
 
-  const supabase: any = createClient(
-    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-    process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  )
+  const supabase: any = adminClient()
 
   try {
-    // 1. Get person info
+    // 1. Get person info — scoped to the authorized organisation, so a person
+    //    id belonging to a different company resolves to "not found".
     const { data: person, error: pErr } = await supabase
       .from('persons')
       .select('id, full_name, email')
       .eq('id', personId)
-      .single()
+      .eq('org_id', orgId)
+      .maybeSingle()
     if (pErr || !person) return res.status(404).json({ error: 'Person not found' })
     if (!person.email) return res.status(400).json({ error: 'Person has no email address — required for DocuSign' })
 
@@ -225,18 +260,19 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
       .select('*')
       .eq('org_id', orgId)
       .eq('person_id', personId)
-      .eq('year', year)
-      .eq('month', month)
-      .single()
+      .eq('year', yearNum)
+      .eq('month', monthNum)
+      .is('project_id', null)
+      .maybeSingle()
     if (eErr || !envelope) return res.status(404).json({ error: 'Timesheet envelope not found' })
     if (envelope.status !== 'Submitted') {
       return res.status(400).json({ error: 'Timesheet must be submitted before signing' })
     }
 
     // 4. Get timesheet days
-    const startDate = `${year}-${String(month).padStart(2, '0')}-01`
-    const lastDay = new Date(year, month, 0).getDate()
-    const endDate = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
+    const startDate = `${yearNum}-${String(monthNum).padStart(2, '0')}-01`
+    const lastDay = new Date(yearNum, monthNum, 0).getDate()
+    const endDate = `${yearNum}-${String(monthNum).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`
 
     const { data: dayRows } = await supabase
       .from('timesheet_days')
@@ -261,8 +297,8 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
     const html = buildTimesheetHtml({
       personName: person.full_name,
       orgName,
-      month: MONTHS[month - 1],
-      year,
+      month: MONTHS[monthNum - 1],
+      year: yearNum,
       totalHours,
       workingDays,
       days,
@@ -272,17 +308,17 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
     const accessToken = await getDocuSignAccessToken(dsConfig)
     const accountId = dsConfig.accountId
     const baseUrl = dsConfig.baseUrl
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://app.grantlume.com'
+    const returnBase = appUrl()
 
     // 7. Create envelope with embedded signing
     const documentBase64 = Buffer.from(html).toString('base64')
 
     const envelopePayload = {
-      emailSubject: `Timesheet for signing: ${MONTHS[month - 1]} ${year} — ${person.full_name}`,
-      emailBlurb: `Please review and sign your timesheet for ${MONTHS[month - 1]} ${year}.`,
+      emailSubject: `Timesheet for signing: ${MONTHS[monthNum - 1]} ${yearNum} — ${person.full_name}`,
+      emailBlurb: `Please review and sign your timesheet for ${MONTHS[monthNum - 1]} ${yearNum}.`,
       documents: [{
         documentId: '1',
-        name: `Timesheet_${person.full_name.replace(/\s+/g, '_')}_${MONTHS[month - 1]}_${year}.html`,
+        name: `Timesheet_${person.full_name.replace(/\s+/g, '_')}_${MONTHS[monthNum - 1]}_${yearNum}.html`,
         htmlDefinition: { source: 'document' },
         documentBase64,
       }],
@@ -327,12 +363,12 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
       return res.status(502).json({ error: 'Failed to create DocuSign envelope', details: errText })
     }
 
-    const envelopeData = await createRes.json()
+    const envelopeData = await createRes.json() as any
     const envelopeId = envelopeData.envelopeId
 
     // 8. Get embedded signing URL (recipient view)
     const viewPayload = {
-      returnUrl: `${appUrl}/timesheets?signed=1&month=${month}&year=${year}`,
+      returnUrl: `${returnBase}/timesheets?signed=1&month=${monthNum}&year=${yearNum}`,
       authenticationMethod: 'none',
       email: person.email,
       userName: person.full_name,
@@ -357,7 +393,7 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
       return res.status(502).json({ error: 'Failed to get signing URL', details: errText })
     }
 
-    const viewData = await viewRes.json()
+    const viewData = await viewRes.json() as any
     const signingUrl = viewData.url
 
     // 9. Update timesheet_entries with signing info
@@ -372,27 +408,28 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
       } as any)
       .eq('org_id', orgId)
       .eq('person_id', personId)
-      .eq('year', year)
-      .eq('month', month)
+      .eq('year', yearNum)
+      .eq('month', monthNum)
+      .is('project_id', null)
 
     // 10. Create in-app notification
-    if (userId) {
-      const { data: personUser } = await supabase
-        .from('persons')
-        .select('user_id')
-        .eq('id', personId)
-        .single()
+    const { data: personUser } = await supabase
+      .from('persons')
+      .select('user_id')
+      .eq('id', personId)
+      .eq('org_id', orgId)
+      .maybeSingle()
 
-      if (personUser?.user_id) {
-        await supabase.from('notifications').insert({
-          user_id: personUser.user_id,
-          org_id: orgId,
-          type: 'approval',
-          title: 'Timesheet ready for signing',
-          message: `Your timesheet for ${MONTHS[month - 1]} ${year} is ready to be signed.`,
-          link: '/timesheets',
-        })
-      }
+    if (personUser?.user_id) {
+      const { error: notifErr } = await supabase.from('notifications').insert({
+        user_id: personUser.user_id,
+        org_id: orgId,
+        type: 'timesheet_ready_to_sign',
+        title: 'Timesheet ready for signing',
+        message: `Your timesheet for ${MONTHS[monthNum - 1]} ${yearNum} is ready to be signed.`,
+        link: '/timesheets',
+      })
+      if (notifErr) console.error('[docusign] notification insert failed:', notifErr.message)
     }
 
     return res.status(200).json({
@@ -402,7 +439,8 @@ async function handleSign(req: VercelRequest, res: VercelResponse) {
     })
   } catch (err) {
     console.error('[docusign] Sign error:', err)
-    return res.status(500).json({ error: 'Internal server error', details: String(err) })
+    // Never echo internal error text back to the client.
+    return res.status(500).json({ error: 'Internal server error' })
   }
 }
 
@@ -418,31 +456,50 @@ async function handleWebhook(req: VercelRequest, res: VercelResponse) {
     console.error('[docusign] DOCUSIGN_CONNECT_HMAC_KEY not set — refusing webhook')
     return res.status(500).json({ error: 'Webhook HMAC key not configured' })
   }
-  const hmacHeader = req.headers['x-docusign-signature-1'] as string
-  if (!hmacHeader) {
-    return res.status(401).json({ error: 'Missing x-docusign-signature-1 header' })
-  }
+
+  // The EXACT bytes DocuSign signed. Hashing JSON.stringify(req.body) instead
+  // of the raw body meant the digest essentially never matched, so every
+  // callback was rejected and timesheets never reached "Signed".
+  const raw = await readRawBody(req)
+
   const { createHmac, timingSafeEqual } = await import('crypto')
-  const body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body)
-  const computed = createHmac('sha256', hmacKey).update(body).digest('base64')
-  // Constant-time comparison to avoid timing oracle attacks.
-  const a = Buffer.from(computed)
-  const b = Buffer.from(hmacHeader)
-  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+  const computed = createHmac('sha256', hmacKey).update(raw).digest('base64')
+
+  // DocuSign may send several signatures (one per configured key) as
+  // x-docusign-signature-1, -2, … Accept if ANY of them matches.
+  const candidates: string[] = []
+  for (let i = 1; i <= 5; i++) {
+    const header = req.headers[`x-docusign-signature-${i}`]
+    if (typeof header === 'string' && header) candidates.push(header)
+  }
+  if (candidates.length === 0) {
+    return res.status(401).json({ error: 'Missing DocuSign signature header' })
+  }
+
+  const expected = Buffer.from(computed)
+  const matched = candidates.some((candidate) => {
+    const actual = Buffer.from(candidate.trim())
+    // Constant-time comparison to avoid a timing oracle.
+    return actual.length === expected.length && timingSafeEqual(actual, expected)
+  })
+
+  if (!matched) {
     console.warn('[docusign] HMAC mismatch — rejecting')
     return res.status(401).json({ error: 'Invalid signature' })
   }
 
-  const supabase: any = createClient(
-    process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-    process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  )
+  let body: any
+  try {
+    body = raw.length ? JSON.parse(raw.toString('utf8')) : {}
+  } catch {
+    console.warn('[docusign] Webhook body was not valid JSON')
+    return res.status(200).json({ message: 'Unparseable payload — ignored' })
+  }
 
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://app.grantlume.com'
+  const supabase: any = adminClient()
+  const returnBase = appUrl()
 
   try {
-    const body = req.body
-
     // Parse envelope info from various DocuSign Connect formats
     let envelopeId: string | undefined
     let envelopeStatus: string | undefined
@@ -494,10 +551,10 @@ async function handleWebhook(req: VercelRequest, res: VercelResponse) {
         return res.status(200).json({ message: 'Envelope not found — ignored' })
       }
 
-      return await processEnvelopeUpdate(supabase, entry2, envelopeStatus, appUrl, res)
+      return await processEnvelopeUpdate(supabase, entry2, envelopeStatus, returnBase, res)
     }
 
-    return await processEnvelopeUpdate(supabase, entry, envelopeStatus, appUrl, res)
+    return await processEnvelopeUpdate(supabase, entry, envelopeStatus, returnBase, res)
   } catch (err) {
     console.error('[docusign] Webhook error:', err)
     return res.status(500).json({ error: 'Internal server error' })
@@ -536,46 +593,57 @@ async function processEnvelopeUpdate(
     const personName = entry.persons?.full_name || 'A team member'
     const period = `${MONTHS[entry.month - 1]} ${entry.year}`
 
+    // NOTE: a Supabase query builder is a "thenable", not a Promise — it has
+    // no .catch(). The previous `.insert(...).catch(() => {})` threw a
+    // TypeError here, which bubbled up as a 500 and made DocuSign retry the
+    // callback forever while the admin emails were never sent.
     if (admins && admins.length > 0) {
-      for (const admin of admins) {
-        await supabase.from('notifications').insert({
-          user_id: admin.user_id,
-          org_id: entry.org_id,
-          type: 'approval',
-          title: 'Timesheet signed',
-          message: `${personName} has signed their timesheet for ${period}. Ready for approval.`,
-          link: '/timesheets',
-        }).catch(() => {})
-      }
+      const rows = admins.map((admin: any) => ({
+        user_id: admin.user_id,
+        org_id: entry.org_id,
+        type: 'timesheet_signed',
+        title: 'Timesheet signed',
+        message: `${personName} has signed their timesheet for ${period}. Ready for approval.`,
+        link: '/timesheets',
+      }))
+      const { error: notifErr } = await supabase.from('notifications').insert(rows)
+      if (notifErr) console.error('[docusign] notification insert failed:', notifErr.message)
     }
 
-    // Send email to admins
+    // Send email to admins — best effort, never fails the webhook.
     try {
       const resendKey = process.env.RESEND_API_KEY
-      if (resendKey && admins) {
+      if (resendKey && admins && admins.length > 0) {
         const resend = new Resend(resendKey)
         const from = 'GrantLume <notifications@grantlume.com>'
 
-        for (const admin of admins) {
-          const { data: userData } = await supabase.auth.admin.getUserById(admin.user_id)
-          const email = userData?.user?.email
-          if (email) {
+        const { data: emailRows } = await supabase.rpc('get_user_emails', {
+          p_user_ids: admins.map((a: any) => a.user_id),
+        })
+
+        for (const row of (emailRows ?? []) as { email: string | null }[]) {
+          if (!row.email) continue
+          try {
             await resend.emails.send({
               from,
-              to: email,
-              subject: `Timesheet signed: ${personName} — ${period}`,
+              to: row.email,
+              subject: `Timesheet signed: ${escapeHtml(personName)} — ${escapeHtml(period)}`,
               html: `
                 <p>Hi,</p>
-                <p><strong>${personName}</strong> has signed their timesheet for <strong>${period}</strong>.</p>
+                <p><strong>${escapeHtml(personName)}</strong> has signed their timesheet for <strong>${escapeHtml(period)}</strong>.</p>
                 <p>The timesheet is now ready for your review and approval.</p>
                 <p><a href="${appUrl}/timesheets">Review Timesheets</a></p>
-                <p style="font-size:12px;color:#6b7280;">GrantLume — Grant & Project Management</p>
+                <p style="font-size:12px;color:#6b7280;">GrantLume — Grant &amp; Project Management</p>
               `,
-            }).catch(() => {})
+            })
+          } catch (mailErr) {
+            console.error('[docusign] admin email failed:', mailErr)
           }
         }
       }
-    } catch { /* email is best-effort */ }
+    } catch (err) {
+      console.error('[docusign] admin email step failed:', err)
+    }
 
     return res.status(200).json({ message: 'Timesheet marked as signed', envelopeId: entry.signature_envelope_id })
 
@@ -591,16 +659,17 @@ async function processEnvelopeUpdate(
       } as any)
       .eq('id', entry.id)
 
-    // Notify the person
+    // Notify the person — again, no .catch() on a query builder.
     if (entry.persons?.user_id) {
-      await supabase.from('notifications').insert({
+      const { error: notifErr } = await supabase.from('notifications').insert({
         user_id: entry.persons.user_id,
         org_id: entry.org_id,
         type: 'warning',
         title: 'Signing declined',
         message: `Your timesheet signing for ${MONTHS[entry.month - 1]} ${entry.year} was declined. You can re-submit and try again.`,
         link: '/timesheets',
-      }).catch(() => {})
+      })
+      if (notifErr) console.error('[docusign] notification insert failed:', notifErr.message)
     }
 
     return res.status(200).json({ message: 'Timesheet signing declined, reverted to Draft' })

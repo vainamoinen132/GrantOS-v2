@@ -144,13 +144,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return handleAuthError(err, res)
     }
 
-    // Override any org_id / user_id present in the request body with the
-    // authenticated values. The client must never be able to charge AI
-    // quota (or read data) against a different organisation by stuffing a
-    // foreign org_id into the body.
+    // Bind the request to the AUTHENTICATED identity, unconditionally.
+    //
+    // The previous version only overwrote org_id `if (auth.orgId)`, so a user
+    // with no organisation membership could still supply any org_id they liked
+    // and have the server act on it with the service-role key.
     if (req.body && typeof req.body === 'object') {
-      if (auth.orgId) req.body.org_id = auth.orgId
+      req.body.org_id = auth.orgId ?? null
       req.body.user_id = auth.userId
+
+      // `storage_path` was a client-controlled path downloaded with the
+      // SERVICE ROLE key, which bypasses storage RLS — i.e. any authenticated
+      // user could have the AI read out any file in the grant-uploads bucket,
+      // including other companies' grant agreements. Every live caller sends
+      // `file_data` (base64) instead, so the parameter is simply refused.
+      if (req.body.storage_path) {
+        return res.status(400).json({
+          error: 'storage_path is no longer accepted — send the file contents as file_data instead',
+        })
+      }
     }
 
     switch (action) {
@@ -189,21 +201,6 @@ function getClaudeAndSupabase() {
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY
   if (!claudeApiKey || !supabaseUrl || !supabaseServiceKey) return null
   return { claudeApiKey, supabase: createClient(supabaseUrl, supabaseServiceKey) }
-}
-
-async function downloadAndExtract(supabase: any, storagePath: string, fileName: string) {
-  const { data: fileData, error: downloadError } = await supabase.storage
-    .from('grant-uploads')
-    .download(storagePath)
-
-  if (downloadError || !fileData) {
-    throw new Error(`Failed to download file: ${downloadError?.message || 'Not found'}`)
-  }
-
-  const arrayBuffer = await fileData.arrayBuffer()
-  const ext = (fileName || storagePath).toLowerCase().split('.').pop() || ''
-
-  return { arrayBuffer, ext }
 }
 
 async function buildContentFromFile(arrayBuffer: ArrayBuffer, ext: string, userPromptText: string) {
@@ -273,7 +270,7 @@ async function callClaude(claudeApiKey: string, systemPrompt: string, messageCon
     throw { status: 502, message: `AI extraction failed (${claudeResponse.status}): ${details}` }
   }
 
-  const claudeData = await claudeResponse.json()
+  const claudeData = await claudeResponse.json() as any
   const textBlock = claudeData.content?.find((b: any) => b.type === 'text')
   if (!textBlock?.text) {
     throw { status: 502, message: 'No text response from AI' }
@@ -389,8 +386,8 @@ async function handleParseGrant(req: VercelRequest, res: VercelResponse) {
     const env = getClaudeAndSupabase()
     if (!env) return res.status(500).json({ error: 'Server credentials not configured' })
 
-    const { storage_path, file_data, file_name, organisation_abbreviation, user_instructions, org_id, user_id } = req.body || {}
-    if (!storage_path && !file_data) return res.status(400).json({ error: 'No storage_path or file_data provided' })
+    const { file_data, organisation_abbreviation, user_instructions, org_id, user_id } = req.body || {}
+    if (!file_data) return res.status(400).json({ error: 'No file_data provided' })
 
     // Quota check
     if (org_id) {
@@ -398,14 +395,8 @@ async function handleParseGrant(req: VercelRequest, res: VercelResponse) {
       if (!quota.allowed) return res.status(429).json({ error: quota.error, quota_exceeded: true })
     }
 
-    let arrayBuffer: ArrayBuffer
-    if (file_data) {
-      const buffer = Buffer.from(file_data, 'base64')
-      arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-    } else {
-      const result = await downloadAndExtract(env.supabase, storage_path, file_name)
-      arrayBuffer = result.arrayBuffer
-    }
+    const buffer = Buffer.from(file_data, 'base64')
+    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
 
     // Send PDF directly to Claude's native document support
     const base64 = Buffer.from(arrayBuffer).toString('base64')
@@ -537,8 +528,8 @@ async function handleParseCollabGrant(req: VercelRequest, res: VercelResponse) {
     const env = getClaudeAndSupabase()
     if (!env) return res.status(500).json({ error: 'Server credentials not configured' })
 
-    const { storage_path, file_data, file_name, user_instructions, org_id, user_id } = req.body || {}
-    if (!storage_path && !file_data) return res.status(400).json({ error: 'No storage_path or file_data provided' })
+    const { file_data, file_name, user_instructions, org_id, user_id } = req.body || {}
+    if (!file_data) return res.status(400).json({ error: 'No file_data provided' })
 
     // Quota check
     if (org_id) {
@@ -546,17 +537,9 @@ async function handleParseCollabGrant(req: VercelRequest, res: VercelResponse) {
       if (!quota.allowed) return res.status(429).json({ error: quota.error, quota_exceeded: true })
     }
 
-    let arrayBuffer: ArrayBuffer
-    let ext: string
-    if (file_data) {
-      const buffer = Buffer.from(file_data, 'base64')
-      arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-      ext = (file_name || '').toLowerCase().split('.').pop() || ''
-    } else {
-      const result = await downloadAndExtract(env.supabase, storage_path, file_name)
-      arrayBuffer = result.arrayBuffer
-      ext = result.ext
-    }
+    const collabBuffer = Buffer.from(file_data, 'base64')
+    const arrayBuffer = collabBuffer.buffer.slice(collabBuffer.byteOffset, collabBuffer.byteOffset + collabBuffer.byteLength)
+    const ext = (file_name || '').toLowerCase().split('.').pop() || ''
 
     let prompt = `Extract collaboration project data from this document (file: "${file_name}").`
     prompt += `\nThis is an EU-funded multi-partner project. Extract ALL project metadata, partners with their budgets, work packages with tasks, deliverables, and milestones.`
@@ -634,9 +617,9 @@ async function handleParseImport(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: 'Server credentials not configured. Please check CLAUDE_API_KEY and Supabase environment variables.' })
     }
 
-    const { storage_path, file_data, file_name, import_type, user_instructions, org_id, user_id } = req.body || {}
-    console.log('[GrantLume] parse-import: params', { storage_path: !!storage_path, file_data: !!file_data, file_name, import_type, org_id })
-    if (!storage_path && !file_data) return res.status(400).json({ error: 'No storage_path or file_data provided' })
+    const { file_data, file_name, import_type, user_instructions, org_id, user_id } = req.body || {}
+    console.log('[GrantLume] parse-import: params', { file_data: !!file_data, file_name, import_type, org_id })
+    if (!file_data) return res.status(400).json({ error: 'No file_data provided' })
     if (!import_type || !['persons', 'projects', 'proposals'].includes(import_type)) {
       return res.status(400).json({ error: 'import_type must be one of: persons, projects, proposals' })
     }
@@ -648,23 +631,13 @@ async function handleParseImport(req: VercelRequest, res: VercelResponse) {
       if (!quota.allowed) return res.status(429).json({ error: quota.error, quota_exceeded: true })
     }
 
-    let arrayBuffer: ArrayBuffer
-    let ext: string
-
-    if (file_data) {
-      // Direct base64 file data — no storage needed
-      console.log('[GrantLume] parse-import: decoding base64 file data…')
-      const buffer = Buffer.from(file_data, 'base64')
-      arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-      ext = (file_name || '').toLowerCase().split('.').pop() || ''
-      console.log('[GrantLume] parse-import: decoded, ext =', ext, 'size =', arrayBuffer.byteLength)
-    } else {
-      console.log('[GrantLume] parse-import: downloading file from storage…')
-      const result = await downloadAndExtract(env.supabase, storage_path, file_name)
-      arrayBuffer = result.arrayBuffer
-      ext = result.ext
-      console.log('[GrantLume] parse-import: file downloaded, ext =', ext, 'size =', arrayBuffer.byteLength)
-    }
+    // Direct base64 file data — no storage round-trip, and therefore no
+    // client-controlled path handed to a service-role download.
+    console.log('[GrantLume] parse-import: decoding base64 file data…')
+    const importBuffer = Buffer.from(file_data, 'base64')
+    const arrayBuffer = importBuffer.buffer.slice(importBuffer.byteOffset, importBuffer.byteOffset + importBuffer.byteLength)
+    const ext = (file_name || '').toLowerCase().split('.').pop() || ''
+    console.log('[GrantLume] parse-import: decoded, ext =', ext, 'size =', arrayBuffer.byteLength)
 
     let prompt = `Extract "${import_type}" data from this document (file: "${file_name}").`
     prompt += `\nReturn a JSON object with a "rows" array matching the "${import_type}" schema from the system prompt.`
