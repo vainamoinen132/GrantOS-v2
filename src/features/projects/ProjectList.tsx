@@ -9,6 +9,7 @@ import { useCollabProjects } from '@/hooks/useCollabProjects'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { SkeletonTable } from '@/components/common/SkeletonTable'
 import { EmptyState } from '@/components/common/EmptyState'
+import { ErrorState } from '@/components/common/ErrorState'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { StatusBadge } from '@/components/common/StatusBadge'
 import { Badge } from '@/components/ui/badge'
@@ -54,7 +55,7 @@ export function ProjectList() {
     search: search || undefined,
     status: statusFilter || undefined,
   }
-  const { projects, isLoading, refetch } = useProjects(filters)
+  const { projects, isLoading, isError, refetch } = useProjects(filters)
 
   // Collaboration projects
   const { collabProjects, isLoading: collabLoading } = useCollabProjects()
@@ -192,6 +193,8 @@ export function ProjectList() {
 
       {isLoading ? (
         <SkeletonTable columns={6} rows={8} />
+      ) : isError ? (
+        <ErrorState onRetry={() => refetch()} />
       ) : visibleProjects.length === 0 && filteredCollab.length === 0 ? (
         <EmptyState
           icon={FolderKanban}

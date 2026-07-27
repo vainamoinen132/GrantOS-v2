@@ -11,6 +11,7 @@ import { PageHeader } from '@/components/layout/PageHeader'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { StatusBadge } from '@/components/common/StatusBadge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Button } from '@/components/ui/button'
 import { formatCurrency } from '@/lib/utils'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -52,15 +53,22 @@ export function Dashboard() {
   const navigate = useNavigate()
   const { orgId, can } = useAuthStore()
   const { globalYear } = useUiStore()
-  const { projects, isLoading: loadingProjects } = useProjects()
-  const { staff, isLoading: loadingStaff } = useStaff({})
-  const { assignments, isLoading: loadingAssignments } = useAssignments('actual')
-  const { budgets: pmBudgets, isLoading: loadingBudgets } = usePmBudgets('actual')
+  const { projects, isLoading: loadingProjects, isError: projectsError, refetch: refetchProjects } = useProjects()
+  const { staff, isLoading: loadingStaff, isError: staffError, refetch: refetchStaff } = useStaff({})
+  const { assignments, isLoading: loadingAssignments, isError: assignmentsError, refetch: refetchAssignments } = useAssignments('actual')
+  const { budgets: pmBudgets, isLoading: loadingBudgets, isError: budgetsError, refetch: refetchBudgets } = usePmBudgets('actual')
 
   const { proposals } = useProposals()
   const { collabProjects } = useCollabProjects()
 
   const isLoading = loadingProjects || loadingStaff || loadingAssignments || loadingBudgets
+  const isError = projectsError || staffError || assignmentsError || budgetsError
+  const retryAll = () => {
+    refetchProjects()
+    refetchStaff()
+    refetchAssignments()
+    refetchBudgets()
+  }
 
   // Pinned report widgets
   const [pinnedReports, setPinnedReports] = useState<ReportTemplate[]>([])
@@ -168,6 +176,17 @@ export function Dashboard() {
   return (
     <div className="space-y-6">
       <PageHeader title={t('dashboard.title')} description={t('dashboard.portfolioOverview', { year: globalYear })} actions={<YearSelector />} />
+
+      {/* Surface load failures so zeroed KPIs aren't mistaken for real data */}
+      {isError && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3">
+          <div className="flex items-center gap-2 text-sm text-destructive">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>{t('common.loadErrorPartial', 'Some data could not be loaded, so figures below may be incomplete.')}</span>
+          </div>
+          <Button variant="outline" size="sm" onClick={retryAll}>{t('common.retry', 'Try again')}</Button>
+        </div>
+      )}
 
       {/* Setup Checklist — shown for new orgs until dismissed */}
       <SetupChecklist />

@@ -342,7 +342,6 @@ export function ImportDialog({ open, onOpenChange, importType, aiMode, onImportC
           org_id: useAuthStore.getState().orgId || '',
           user_id: useAuthStore.getState().user?.id || '',
         }
-        console.log('[AI Import] Request body (without file_data):', { ...reqBody, file_data: `[${base64.length} chars]` })
         let response: Response
         try {
           response = await apiFetch('/api/ai?action=parse-import', {
@@ -480,7 +479,6 @@ export function ImportDialog({ open, onOpenChange, importType, aiMode, onImportC
     setImporting(true)
     try {
       const rows = getMappedRows()
-      console.log('[Import] Inserting', rows.length, 'rows into', config.table, '— sample row:', rows[0])
 
       const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
       const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY

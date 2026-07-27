@@ -47,7 +47,11 @@ export class ErrorBoundary extends Component<Props, State> {
           </div>
           <h2 className="text-lg font-semibold">{i18n.t('errorBoundary.title')}</h2>
           <p className="text-sm text-muted-foreground max-w-md">
-            {this.state.error?.message || i18n.t('errorBoundary.unexpected')}
+            {/* Only surface the raw error text in development. In production
+                show a friendly message so internal details aren't leaked. */}
+            {import.meta.env.DEV && this.state.error?.message
+              ? this.state.error.message
+              : i18n.t('errorBoundary.unexpected')}
           </p>
           <div className="flex gap-2">
             <Button variant="outline" onClick={this.handleReset}>

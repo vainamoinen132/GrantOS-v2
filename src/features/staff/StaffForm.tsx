@@ -390,6 +390,9 @@ export function StaffForm() {
               <div className="space-y-2">
                 <Label htmlFor="email">{t('common.email')}</Label>
                 <Input id="email" type="email" {...register('email')} />
+                {errors.email && (
+                  <p className="text-sm text-destructive">{errors.email.message}</p>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -538,6 +541,9 @@ export function StaffForm() {
                 <div className="space-y-2">
                   <Label htmlFor="end_date">{t('staff.endDate')}</Label>
                   <Input id="end_date" type="date" {...register('end_date')} />
+                  {errors.end_date && (
+                    <p className="text-sm text-destructive">{errors.end_date.message}</p>
+                  )}
                 </div>
               </div>
 
@@ -551,6 +557,9 @@ export function StaffForm() {
                   {...register('vacation_days_per_year')}
                   placeholder="e.g. 25"
                 />
+                {errors.vacation_days_per_year && (
+                  <p className="text-sm text-destructive">{errors.vacation_days_per_year.message}</p>
+                )}
                 <p className="text-[11px] text-muted-foreground">{t('staff.vacationDaysDesc')}</p>
               </div>
 
@@ -563,6 +572,9 @@ export function StaffForm() {
                     step="0.01"
                     {...register('annual_salary')}
                   />
+                  {errors.annual_salary && (
+                    <p className="text-sm text-destructive">{errors.annual_salary.message}</p>
+                  )}
                 </div>
               )}
             </CardContent>

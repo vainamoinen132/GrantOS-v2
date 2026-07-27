@@ -38,7 +38,12 @@ function cors(req: VercelRequest, res: VercelResponse) {
   const origin = (req.headers.origin as string) || ''
   if (ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin)
-  } else if (process.env.VERCEL_ENV === 'preview' && origin) {
+  } else if (
+    process.env.VERCEL_ENV === 'preview' &&
+    // Only reflect origins that actually look like Vercel preview URLs, not
+    // any arbitrary origin claiming to be a preview.
+    /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)
+  ) {
     res.setHeader('Access-Control-Allow-Origin', origin)
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')

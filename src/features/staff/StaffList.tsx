@@ -11,6 +11,7 @@ import { ImportExportButtons } from '@/components/common/ImportExportButtons'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { SkeletonTable } from '@/components/common/SkeletonTable'
 import { EmptyState } from '@/components/common/EmptyState'
+import { ErrorState } from '@/components/common/ErrorState'
 import { ConfirmModal } from '@/components/common/ConfirmModal'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -41,7 +42,7 @@ export function StaffList() {
     search: search || undefined,
     is_active: activeFilter,
   }
-  const { staff, isLoading, refetch } = useStaff(filters)
+  const { staff, isLoading, isError, refetch } = useStaff(filters)
 
   // Fetch absence days used per person for the current year
   const currentYear = new Date().getFullYear()
@@ -150,6 +151,8 @@ export function StaffList() {
 
       {isLoading ? (
         <SkeletonTable columns={6} rows={8} />
+      ) : isError ? (
+        <ErrorState onRetry={() => refetch()} />
       ) : staff.length === 0 ? (
         <EmptyState
           icon={Users}

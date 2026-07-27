@@ -4,6 +4,7 @@ import { useBudgetSummary } from '@/hooks/useFinancials'
 import { useProjects } from '@/hooks/useProjects'
 import { SkeletonTable } from '@/components/common/SkeletonTable'
 import { EmptyState } from '@/components/common/EmptyState'
+import { ErrorState } from '@/components/common/ErrorState'
 import { DollarSign } from 'lucide-react'
 import { formatCurrency } from '@/lib/utils'
 import { cn } from '@/lib/utils'
@@ -27,9 +28,10 @@ interface ProjectBudget {
 
 export function BudgetVsActuals() {
   const { t } = useTranslation()
-  const { rows, isLoading: loadingBudgets } = useBudgetSummary()
-  const { projects, isLoading: loadingProjects } = useProjects()
+  const { rows, isLoading: loadingBudgets, isError: budgetsError, refetch: refetchBudgets } = useBudgetSummary()
+  const { projects, isLoading: loadingProjects, isError: projectsError, refetch: refetchProjects } = useProjects()
   const isLoading = loadingBudgets || loadingProjects
+  const isError = budgetsError || projectsError
 
   const projectBudgets = useMemo(() => {
     const map = new Map<string, ProjectBudget>()
@@ -107,6 +109,17 @@ export function BudgetVsActuals() {
   }, [projectBudgets])
 
   if (isLoading) return <SkeletonTable columns={6} rows={6} />
+
+  if (isError) {
+    return (
+      <ErrorState
+        onRetry={() => {
+          refetchBudgets()
+          refetchProjects()
+        }}
+      />
+    )
+  }
 
   if (projectBudgets.length === 0) {
     return (

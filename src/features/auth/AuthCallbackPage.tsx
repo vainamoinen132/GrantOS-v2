@@ -45,9 +45,6 @@ export function AuthCallbackPage() {
         const type = params.get('type')
         const accessToken = hashParams.get('access_token')
 
-        console.log('[AuthCallback] URL:', window.location.href)
-        console.log('[AuthCallback] code:', !!code, 'token_hash:', !!tokenHash, 'type:', type, 'hash access_token:', !!accessToken)
-
         // 1. PKCE flow — ?code=...
         if (code) {
           console.log('[AuthCallback] Exchanging PKCE code...')
@@ -59,7 +56,6 @@ export function AuthCallbackPage() {
             return
           }
           if (data.session) {
-            console.log('[AuthCallback] Code exchange success, user:', data.session.user.email)
             await onSuccess(type)
             return
           }
@@ -114,7 +110,6 @@ export function AuthCallbackPage() {
           return
         }
         if (session) {
-          console.log('[AuthCallback] Session found via getSession, user:', session.user.email)
           await onSuccess(type)
           return
         }
@@ -158,7 +153,6 @@ export function AuthCallbackPage() {
         }
 
         setInviteContext(ctx)
-        console.log('[AuthCallback] Found invite context:', JSON.stringify(ctx))
 
         if (ctx.type === 'collab' && ctx.token) {
           // Accept collab invitation. The endpoint now requires a JWT —

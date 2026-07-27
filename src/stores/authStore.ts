@@ -292,7 +292,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
           emailRedirectTo: `${window.location.origin}/auth/callback`,
         },
       })
-      console.log('[SignUp] Response:', { error, user: data?.user?.id, identities: data?.user?.identities?.length })
       if (error) throw error
 
       // Supabase returns a user with empty identities when the email already exists

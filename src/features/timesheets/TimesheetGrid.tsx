@@ -756,7 +756,7 @@ export function TimesheetGrid() {
           <div className="space-y-1">
             <label className="text-xs font-medium text-muted-foreground">Month</label>
             <div className="flex items-center gap-1">
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={prevMonth}>
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={prevMonth} aria-label="Previous month">
                 <ChevronLeft className="h-4 w-4" />
               </Button>
               <div className="inline-flex items-center rounded-lg border bg-muted/40 p-0.5 gap-0.5 flex-wrap">
@@ -775,7 +775,7 @@ export function TimesheetGrid() {
                   </button>
                 ))}
               </div>
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={nextMonth}>
+              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={nextMonth} aria-label="Next month">
                 <ChevronRight className="h-4 w-4" />
               </Button>
             </div>
