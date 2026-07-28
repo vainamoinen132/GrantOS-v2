@@ -5,8 +5,9 @@ addressed in the critical-fix pass; everything else is open work, ordered by
 priority within each section.
 
 Reference for the critical pass:
-`supabase/2026_07_part1_additive.sql` (run before deploy) and
-`supabase/2026_07_part2_lockdown.sql` (run after deploy).
+`supabase/2026_07_part1_additive.sql` and `supabase/2026_07_part2_lockdown.sql`
+— **both applied to production on 2026-07-28**, verified by
+`supabase/verify_migration.sql` (14/14 PASS).
 
 ---
 
@@ -235,6 +236,12 @@ arbitrary one. The login crash is fixed, but the model still can't represent
 - **B29.** Duplicate RLS helpers: `auth_org_id()`/`auth_role()` and
   `get_user_org_id()`/`get_user_role()` do the same thing and different
   migrations use different ones. Consolidate on one pair.
+- **B29b.** The `Pending partner sees own invite` policy on `project_partners`
+  matches `lower(contact_email) = lower(COALESCE(auth.jwt() ->> 'email', ''))`.
+  The `COALESCE(..., '')` means a caller whose token carries no email would
+  match any partner row saved with an **empty-string** contact email. Very
+  unlikely in practice. Tighten to
+  `contact_email IS NOT NULL AND contact_email <> '' AND auth.jwt() ->> 'email' IS NOT NULL`.
 - **B30.** `api/lib/rateLimit.ts` registers a `setInterval` at module scope,
   which keeps a timer alive in every serverless instance. Harmless today, but
   prefer lazy cleanup on access.
