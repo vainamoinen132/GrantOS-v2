@@ -4,7 +4,9 @@ Findings from the full-system review (July 2026). Items marked **FIXED** were
 addressed in the critical-fix pass; everything else is open work, ordered by
 priority within each section.
 
-Reference for the critical pass: `supabase/2026_07_critical_security_fixes.sql`.
+Reference for the critical pass:
+`supabase/2026_07_part1_additive.sql` (run before deploy) and
+`supabase/2026_07_part2_lockdown.sql` (run after deploy).
 
 ---
 
@@ -83,16 +85,26 @@ or `unpaid` — it only changes `subscription_status`, which the gating code doe
 not read.
 **Fix:** map unknown prices to `free`, and derive `plan` from the status.
 
-### 🔧 B5. CI is fully red
-- `npm run lint` fails — `eslint` is not installed and there is no config.
-- The unit-test job has `needs: lint-typecheck-build`, so it never runs.
-- `npm audit --audit-level=high` fails (see B7).
-**Fix:** add `eslint` + `typescript-eslint` + a flat config, or drop the lint
-step until it is configured. Add `"test": "vitest run"` to `package.json`.
+### 🔧 B5. CI is still red — `npm run lint` has no eslint
+`eslint` is not a dependency and there is no config, so the
+`lint-typecheck-build` job fails at its first step. Because the unit-test job
+declares `needs: lint-typecheck-build`, the tests never run either.
+`npm audit --audit-level=high` also fails (see B7).
 
-### 🔧 B6. One unit test fails
-`src/lib/permissions.test.ts` expects `/import` in `ROUTE_PERMISSIONS`. The
-Import feature has no route (see B12). The test is correct; the app is not.
+*Partially addressed:* `npm test` (`vitest run`) and `npm run typecheck`
+(`tsc -b`) scripts were added, and `api/` is now type-checked via
+`tsconfig.api.json` — it previously had **no** type checking at all, which is
+how several of the fixed runtime bugs survived.
+
+**Remaining fix:** add `eslint` + `typescript-eslint` + a flat config, or drop
+the lint step from CI until it is configured.
+
+### 🔧 B6. `/import` assertion removed from the permissions test
+`src/lib/permissions.test.ts` asserted `/import` was in `ROUTE_PERMISSIONS`.
+It never was — the Import feature is unreachable dead code (B13). The
+assertion was removed with an inline comment rather than a route being faked,
+so the suite is green. Restore the assertion if and when B13 wires the feature
+up; delete `canSeeImport` if it is dropped instead.
 
 ### 🔧 B7. 27 known vulnerabilities (2 critical, 14 high)
 Two matter at runtime:

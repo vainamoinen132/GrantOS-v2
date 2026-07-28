@@ -1,34 +1,33 @@
 -- ============================================================================
--- GrantLume — CRITICAL security & correctness fixes (July 2026)
+-- GrantLume — CRITICAL security fixes, PART 1 of 2 : ADDITIVE
 -- ============================================================================
 --
--- HOW TO RUN
---   1. Take a database backup / point-in-time-restore checkpoint first.
---   2. Paste this whole file into the Supabase SQL Editor and run it ONCE.
---   3. Deploy the matching application code in the SAME release. Several
---      changes here are breaking for the OLD client (see "BREAKING" notes).
---   4. Run the verification queries at the bottom and check the output.
+--   ►  RUN THIS FIRST. It is safe to run while the CURRENT (old) code is live.
+--   ►  Nothing in this file breaks the running application.
 --
--- This file is idempotent — re-running it is safe.
+-- It closes the worst holes immediately — org takeover, the persons_masked
+-- RLS bypass, the grant-uploads bucket, the leaky invite-token policy — and
+-- creates everything the new code needs (persons_secure, get_personnel_costs,
+-- the email/user-lookup RPCs, the notification CHECK, the upsert indexes).
 --
--- WHAT IT FIXES
---   C1  Any user could make themselves Admin of any organisation
---   C2  persons_masked bypassed RLS → cross-tenant staff directory leak
---   C3  Salary / overhead readable by every org member
---   C4  DocuSign RSA private key readable by every org member
---   C5  grant-uploads bucket: cross-tenant read AND delete
---   C6  project-documents bucket: unsecured / public
---   C7  Notification type CHECK rejected every cron + billing notification
---   C8  Timesheet state machine guarded a table that does not exist
---   C9  Bulk allocation upsert had no usable ON CONFLICT target
---   C10 Failed-login audit entries could never be written
---   C11 Belt-and-braces: re-drop the leaky pending-invite policy
---   C12 SECURITY DEFINER helpers without a pinned search_path
+-- The three changes that would break the old client are deferred to
+-- PART 2 (2026_07_part2_lockdown.sql):
+--     1. REVOKE SELECT on persons          (hides salary)
+--     2. REVOKE SELECT on organisations    (hides the DocuSign private key)
+--     3. project-documents bucket → private
 --
--- BREAKING for old clients:
---   - `select('*')` on `persons` now fails (salary columns revoked)  → C3
---   - `select('*')` on `organisations` now fails (RSA key revoked)   → C4
---   - `project-documents` public URLs stop working                   → C6
+-- DEPLOY ORDER
+--   1. Back up / create a restore point.
+--   2. Run THIS file.                       ← app keeps working, old or new
+--   3. Deploy the application code.
+--   4. Run PART 2.                          ← finishes the lockdown
+--   5. Run the verification queries at the end of PART 2.
+--
+-- FRESH OR STAGING DATABASE (no live users)?
+--   Just run PART 1 then PART 2 back to back. The split only exists to avoid
+--   a breakage window against a running old client.
+--
+-- Idempotent: safe to re-run.
 -- ============================================================================
 
 BEGIN;
@@ -324,31 +323,10 @@ END $$;
 -- Admins can still edit salaries — they just cannot read them back in a
 -- RETURNING clause. The client has been updated to select explicit columns.
 
--- IMPORTANT — why this is a REVOKE-then-GRANT and not a column REVOKE.
---
--- PostgreSQL only lets you revoke a column-level privilege that was granted at
--- the column level. Supabase grants `SELECT ON ALL TABLES` to `authenticated`
--- at the TABLE level, so a plain
---     REVOKE SELECT (annual_salary) ON persons FROM authenticated;
--- silently does nothing and the salary stays readable.
---
--- The only way to restrict columns is to drop the table-level SELECT and
--- re-grant SELECT on the permitted columns. The list is built from
--- information_schema so it can never drift out of sync with the real schema.
-DO $$
-DECLARE
-  safe_cols TEXT;
-BEGIN
-  SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
-    INTO safe_cols
-  FROM information_schema.columns
-  WHERE table_schema = 'public'
-    AND table_name = 'persons'
-    AND column_name NOT IN ('annual_salary', 'overhead_rate');
-
-  EXECUTE 'REVOKE SELECT ON public.persons FROM anon, authenticated';
-  EXECUTE format('GRANT SELECT (%s) ON public.persons TO authenticated', safe_cols);
-END $$;
+-- >>> The REVOKE that actually hides the salary columns lives in PART 2.
+--     It is deferred because it breaks the OLD client's `select('*')` on
+--     persons. Everything above (the persons_secure view, can_see_salary())
+--     is additive and safe to run while the old code is still live.
 
 -- persons_secure: the single read path for staff data.
 --   * NOT security_invoker — it must be able to read the revoked columns.
@@ -434,26 +412,10 @@ GRANT EXECUTE ON FUNCTION get_personnel_costs(UUID, INT, TEXT) TO authenticated;
 ALTER TABLE organisations
   ADD COLUMN IF NOT EXISTS docusign_key_configured BOOLEAN NOT NULL DEFAULT FALSE;
 
--- Same REVOKE-then-GRANT reasoning as the persons table above: a column-level
--- revoke is a no-op against Supabase's table-level grant.
---
--- Note this removes SELECT only. UPDATE is untouched, so an Admin can still
--- SAVE a new private key — they just can never read one back. The client sends
--- the key column only when a new key is typed.
-DO $$
-DECLARE
-  safe_cols TEXT;
-BEGIN
-  SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position)
-    INTO safe_cols
-  FROM information_schema.columns
-  WHERE table_schema = 'public'
-    AND table_name = 'organisations'
-    AND column_name <> 'docusign_rsa_private_key';
-
-  EXECUTE 'REVOKE SELECT ON public.organisations FROM anon, authenticated';
-  EXECUTE format('GRANT SELECT (%s) ON public.organisations TO authenticated', safe_cols);
-END $$;
+-- >>> The REVOKE that actually hides docusign_rsa_private_key lives in
+--     PART 2, for the same reason: it breaks the OLD client's `select('*')`
+--     on organisations. The docusign_key_configured column and its trigger
+--     above are additive.
 
 CREATE OR REPLACE FUNCTION sync_docusign_key_configured()
 RETURNS TRIGGER
@@ -848,9 +810,12 @@ CREATE POLICY "Org members manage grant uploads"
   );
 
 -- ── project-documents ──────────────────────────────────────────────────────
+-- Create it if it is somehow missing, but DO NOT flip `public` yet — the old
+-- client still serves documents through permanent public URLs. PART 2 makes it
+-- private once the new signed-URL code is live.
 INSERT INTO storage.buckets (id, name, public, file_size_limit)
 VALUES ('project-documents', 'project-documents', FALSE, 52428800)  -- 50 MB
-ON CONFLICT (id) DO UPDATE SET public = FALSE, file_size_limit = 52428800;
+ON CONFLICT (id) DO UPDATE SET file_size_limit = 52428800;
 
 DROP POLICY IF EXISTS "Org members read project documents"    ON storage.objects;
 DROP POLICY IF EXISTS "Org members write project documents"   ON storage.objects;
@@ -893,48 +858,20 @@ CREATE POLICY "Org members manage avatars"
 
 
 -- ============================================================================
--- VERIFICATION — run these and check the output
+-- PART 1 COMPLETE
 -- ============================================================================
+-- Quick sanity checks (full verification is at the end of PART 2):
 --
--- 1. No policy should allow self-insert into org_members:
---      SELECT policyname, cmd, with_check FROM pg_policies
---       WHERE tablename = 'org_members';
---    Expect NO policy named "orgmem_insert_self", and no INSERT policy other
---    than the Admin-scoped "orgmem_all_admin".
+--   -- persons_secure must exist and be readable
+--   SELECT count(*) FROM persons_secure;
 --
--- 1b. Onboarding must still work end to end. Sign up a brand-new account and
---     create an organisation — it goes through create_organisation().
+--   -- persons_masked must now enforce RLS
+--   SELECT relname, reloptions FROM pg_class WHERE relname = 'persons_masked';
+--   -- expect reloptions to contain security_invoker=true
 --
--- 2. persons_masked must enforce RLS:
---      SELECT relname, reloptions FROM pg_class WHERE relname = 'persons_masked';
---    Expect reloptions to contain security_invoker=true.
+--   -- no self-insert policy on org_members
+--   SELECT policyname, cmd FROM pg_policies WHERE tablename = 'org_members';
 --
--- 3. Salary columns must not be readable by the app roles:
---      SELECT grantee, privilege_type, column_name
---        FROM information_schema.column_privileges
---       WHERE table_name = 'persons' AND column_name IN ('annual_salary','overhead_rate')
---         AND grantee IN ('anon','authenticated');
---    Expect NO rows with privilege_type = 'SELECT'.
---
--- 4. DocuSign key must not be readable:
---      SELECT grantee, privilege_type FROM information_schema.column_privileges
---       WHERE table_name = 'organisations'
---         AND column_name = 'docusign_rsa_private_key'
---         AND grantee IN ('anon','authenticated') AND privilege_type = 'SELECT';
---    Expect NO rows.
---
--- 5. Buckets must be private:
---      SELECT id, public FROM storage.buckets;
---    Expect public = false for grant-uploads and project-documents
---    (avatars stays true by design).
---
--- 6. Assignment upsert arbiter must exist:
---      SELECT indexname FROM pg_indexes WHERE tablename = 'assignments';
---    Expect both idx_assignments_unique_combo and idx_assignments_upsert_with_wp.
---
--- 7. No pending-invite leak:
---      SELECT policyname, qual FROM pg_policies
---       WHERE tablename IN ('project_partners','proposal_partners');
---    Expect NO policy whose qual is just (invite_status = 'pending').
---
+-- Next: deploy the application code, then run
+--       supabase/2026_07_part2_lockdown.sql
 -- ============================================================================
